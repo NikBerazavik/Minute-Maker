@@ -1,0 +1,16 @@
+# Committed to git — never put secrets here. Env vars live in the Netlify
+# dashboard (Site configuration -> Environment variables) or `netlify env:set`.
+
+[build]
+  publish = "public"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Function routing, timeouts and schedules are declared in each function file
+# via `export const config = {...}`:
+#   netlify/functions/telegram.js            path /telegram   background
+#   netlify/functions/fireflies.js           path /fireflies  synchronous
+#   netlify/functions/promote-background.js  path /promote    background
+#   netlify/functions/sweep.js               schedule 0 10 * * 5  (Fri 17:00 Bangkok)

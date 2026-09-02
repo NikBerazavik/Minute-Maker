@@ -1,0 +1,22 @@
+{
+  "name": "minute-maker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram -> Fireflies -> Claude -> Notion meeting recap pipeline (Netlify)",
+  "type": "module",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "scripts": {
+    "verify": "node --env-file=.env scripts/verify.js",
+    "test": "node scripts/test-render.js && node scripts/test-flow.js",
+    "test:render": "node scripts/test-render.js",
+    "test:flow": "node scripts/test-flow.js",
+    "test:llm": "node --env-file=.env scripts/test-llm.js",
+    "webhook:set": "node --env-file=.env scripts/setup-webhook.js",
+    "webhook:info": "node --env-file=.env scripts/setup-webhook.js info",
+    "webhook:delete": "node --env-file=.env scripts/setup-webhook.js delete",
+    "sign": "node --env-file=.env scripts/sign.js",
+    "dev": "npx netlify-cli dev"
+  }
+}

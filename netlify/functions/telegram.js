@@ -1,0 +1,188 @@
+import { config as app } from "../../lib/config.js";
+import { sendMessage, answerCallbackQuery, editMessageText } from "../../lib/telegram.js";
+import { findMeetingByFirefliesId, findSweepablePages } from "../../lib/notion.js";
+import { promoteMeeting, skipMeeting, triggerPromotions } from "../../lib/promote.js";
+import { addToLiveMeeting, FirefliesError } from "../../lib/fireflies.js";
+import { runAgent } from "../../lib/agent.js";
+
+// ---------------------------------------------------------------------------
+// Telegram webhook.
+//
+// A BACKGROUND function: Netlify returns 202 the moment it is invoked, which
+// is all Telegram needs, and the handler then gets up to 15 minutes. That is
+// what makes it possible to run a full transcript extraction inline on a Yes
+// tap — a synchronous function would time out long before.
+//
+// Consequences of being a background function, both handled below:
+//   1. The Response returned here is ignored, so the auth checks gate the WORK
+//      rather than the status code. An unauthenticated caller gets a 202 and
+//      nothing happens.
+//   2. A thrown error makes Netlify retry the invocation twice (after 1 and 2
+//      minutes). Nothing in this handler may throw.
+// ---------------------------------------------------------------------------
+
+const HELP = [
+  "I turn your Fireflies meetings into Notion recaps.",
+  "",
+  "/join <meeting link> <title>  — send the Fireflies bot to a live meeting",
+  "/sweep — process any meeting still waiting on a Yes/No answer",
+  "/help — this message",
+  "",
+  "When a transcript is ready I'll ask whether you want a recap. Tap Yes or No.",
+  "",
+  "Anything else you type, I answer from your meeting notes:",
+  '- "what did we decide about the 5G report?"',
+  '- "what happened in the UAT meeting last week?"',
+  '- "add a note to the UAT meeting: Joao agreed to send the policy draft"',
+].join("\n");
+
+async function handleJoin(argText) {
+  const trimmed = argText.trim();
+  if (!trimmed) {
+    return sendMessage("Usage: /join <meeting link> <title>");
+  }
+
+  const [linkPart, ...titleParts] = trimmed.split(/\s+/);
+  let link;
+  try {
+    link = new URL(linkPart);
+    if (link.protocol !== "http:" && link.protocol !== "https:") throw new Error("not http");
+  } catch {
+    return sendMessage(`That doesn't look like a meeting link: ${linkPart}`);
+  }
+
+  const title = titleParts.join(" ").trim();
+  try {
+    const result = await addToLiveMeeting({ meeting_link: link.href, title: title || undefined });
+    if (result?.success === false) {
+      return sendMessage(`Fireflies refused to join: ${result.message || "no reason given"}`);
+    }
+    return sendMessage(`Fireflies is joining${title ? ` "${title}"` : ""}. I'll ask about a recap when the transcript is ready.`);
+  } catch (err) {
+    if (err instanceof FirefliesError && err.isRateLimited) {
+      // No retry button: callback_data is capped at 64 bytes and a Teams link
+      // is far longer than that, so there is nowhere to keep the link.
+      return sendMessage(
+        "Fireflies is rate limited — it allows 3 join requests per 20 minutes. Wait a few minutes and send the same /join again."
+      );
+    }
+    return sendMessage(`Could not ask Fireflies to join: ${err.message}`);
+  }
+}
+
+async function handleSweep() {
+  const pending = await findSweepablePages({ includeFailed: true, limit: 20 });
+  if (pending.length === 0) {
+    return sendMessage("Nothing is waiting — every meeting is recapped or skipped.");
+  }
+
+  // Each promotion runs in its own background invocation rather than inline:
+  // 20 transcripts back to back would not fit in this function's 15 minutes.
+  // Every run reports its own result, so the reply here is just the receipt.
+  const triggered = await triggerPromotions(pending, { allowFailed: true });
+  const lines = [`Recapping ${triggered} meeting(s). I'll message you as each one lands.`];
+  for (const m of pending.slice(0, triggered)) lines.push(`- ${m.name}`);
+  if (triggered < pending.length) {
+    lines.push("", `${pending.length - triggered} could not be started — check the Netlify logs.`);
+  }
+  return sendMessage(lines.join("\n"));
+}
+
+async function handleCallback(callbackQuery) {
+  const [action, meetingId] = String(callbackQuery.data || "").split(":");
+  const chatId = callbackQuery.message?.chat?.id;
+  const messageId = callbackQuery.message?.message_id;
+
+  // Always answer, or the client shows a spinner until it times out.
+  await answerCallbackQuery(callbackQuery.id, action === "yes" ? "Working on it" : "Skipping");
+
+  const meeting = await findMeetingByFirefliesId(meetingId);
+  if (!meeting) {
+    return editMessageText(chatId, messageId, `No Notion page found for meeting ${meetingId}.`);
+  }
+
+  // Editing without reply_markup removes the keyboard, so the prompt cannot be
+  // tapped twice while the extraction runs.
+  if (action === "yes") {
+    await editMessageText(chatId, messageId, `Yes — building the recap for "${meeting.name}"...`);
+    const result = await promoteMeeting(meeting.page_id);
+    if (result.skipped) {
+      await sendMessage(`Nothing to do: that meeting ${result.reason}.`);
+    }
+    return;
+  }
+
+  if (action === "no") {
+    const result = await skipMeeting(meeting.page_id);
+    return editMessageText(
+      chatId,
+      messageId,
+      result.skipped ? `Skipped. The page stays as a record that the meeting happened.` : `Not skipped: it ${result.reason}.`
+    );
+  }
+
+  return editMessageText(chatId, messageId, `Unrecognised action "${action}".`);
+}
+
+async function handleMessage(text) {
+  if (text === "/start" || text === "/help") return sendMessage(HELP);
+
+  const [command, ...rest] = text.split(/\s+/);
+  if (command === "/join") return handleJoin(rest.join(" "));
+  if (command === "/sweep") return handleSweep();
+
+  const { text: reply, usage } = await runAgent(text);
+  console.log(`Handled message. Tokens in=${usage.input} out=${usage.output}`);
+  return sendMessage(reply);
+}
+
+export default async (req) => {
+  // Netlify ignores this response for a background function; it exists so the
+  // handler has a single, honest exit shape.
+  const accepted = new Response(null, { status: 202 });
+
+  if (req.method !== "POST") return accepted;
+
+  try {
+    // Auth gate 1: the secret token Telegram echoes on every delivery.
+    // Inside the try because a missing env var throws here, and a throw out of
+    // a background function makes Netlify re-run the whole invocation.
+    if (req.headers.get("x-telegram-bot-api-secret-token") !== app.telegram.webhookSecret()) {
+      console.warn("Rejected Telegram update with a bad or missing secret token.");
+      return accepted;
+    }
+
+    let update;
+    try {
+      update = await req.json();
+    } catch {
+      console.warn("Telegram update was not JSON.");
+      return accepted;
+    }
+
+    const callbackQuery = update.callback_query;
+    const message = update.message || update.edited_message;
+
+    // Auth gate 2: only you. The bot's username is discoverable, so this is
+    // what actually stops strangers from driving the pipeline.
+    const fromId = String(callbackQuery?.from?.id ?? message?.chat?.id ?? "");
+    if (fromId !== app.telegram.chatId()) {
+      if (fromId) console.warn(`Ignoring update from unauthorised id ${fromId}.`);
+      return accepted;
+    }
+
+    if (callbackQuery) {
+      await handleCallback(callbackQuery);
+    } else if (message?.text?.trim()) {
+      await handleMessage(message.text.trim());
+    }
+  } catch (err) {
+    // Never rethrow: Netlify would retry this whole invocation twice.
+    console.error("Telegram handler error:", err);
+    await sendMessage(`Something went wrong: ${err.message}`).catch(() => {});
+  }
+
+  return accepted;
+};
+
+export const config = { path: "/telegram", background: true };
