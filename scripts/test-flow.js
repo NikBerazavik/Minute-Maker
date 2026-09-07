@@ -55,6 +55,7 @@ const store = {
   promoteCalls: [], // bodies POSTed to the /promote background function
   transcriptFetches: 0,
   transcriptExists: true,
+  lastJoin: null, // variables sent on the last addToLiveMeeting call
 };
 
 const SCHEMA = {
@@ -197,6 +198,7 @@ globalThis.fetch = async (url, options = {}) => {
   // ----- Fireflies ---------------------------------------------------------
   if (u === "https://api.fireflies.ai/graphql") {
     if (body.query.includes("addToLiveMeeting")) {
+      store.lastJoin = body.variables;
       return json({ data: { addToLiveMeeting: { success: true, message: "joining" } } });
     }
     if (body.query.includes("transcript(")) {
@@ -523,6 +525,97 @@ await test("/join calls Fireflies and confirms", async () => {
   );
   const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage");
   assert(/joining/i.test(reply.body.text), `unexpected reply: ${reply.body.text}`);
+  assert(/auto-detecting/.test(reply.body.text), `should say it is auto-detecting: ${reply.body.text}`);
+});
+
+await test("/join defaults to auto language detection", async () => {
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: "/join https://teams.microsoft.com/meet/456 Thai standup" } })
+  );
+  equal(store.lastJoin.language, "auto", "default language");
+  equal(store.lastJoin.title, "Thai standup", "title unaffected");
+});
+
+await test("/join --lang overrides the default and is stripped from the title", async () => {
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: "/join https://teams.microsoft.com/meet/789 English sync --lang en" } })
+  );
+  equal(store.lastJoin.language, "en", "override language");
+  equal(store.lastJoin.title, "English sync", "--lang and its value must not leak into the title");
+});
+
+await test("a trailing 'thai' sets the language without needing --lang", async () => {
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: "/join https://teams.microsoft.com/meet/th1 Weekly sync thai" } })
+  );
+  equal(store.lastJoin.language, "th", "language from the trailing word");
+  equal(store.lastJoin.title, "Weekly sync", "the language word must not leak into the title");
+});
+
+await test("a trailing 'english' maps to the en code", async () => {
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: "/join https://teams.microsoft.com/meet/en1 Board review english" } })
+  );
+  equal(store.lastJoin.language, "en", "english must map to en");
+  equal(store.lastJoin.title, "Board review", "title");
+});
+
+await test("a title with no recognised trailing word is left untouched", async () => {
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: "/join https://teams.microsoft.com/meet/def1 Ordinary title" } })
+  );
+  equal(store.lastJoin.language, "auto", "should fall back to the default");
+  equal(store.lastJoin.title, "Ordinary title", "title must be untouched");
+});
+
+await test("--lang wins over a trailing alias word if somehow both are present", async () => {
+  await telegramFn(
+    telegramRequest({
+      message: { chat: { id: 12345 }, text: "/join https://teams.microsoft.com/meet/both1 Sync thai --lang en" },
+    })
+  );
+  equal(store.lastJoin.language, "en", "the explicit flag should win");
+});
+
+await test("/join with a quoted title sends the right title and language", async () => {
+  store.lastJoin = null;
+  await telegramFn(
+    telegramRequest({
+      message: { chat: { id: 12345 }, text: '/join https://teams.microsoft.com/meet/q1 "Weekly sync with Joao" thai' },
+    })
+  );
+  equal(store.lastJoin.title, "Weekly sync with Joao", "title");
+  equal(store.lastJoin.language, "th", "language");
+});
+
+await test("a quoted title ending in a language word is not mangled", async () => {
+  store.lastJoin = null;
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: '/join https://teams.microsoft.com/meet/q2 "Learn Thai"' } })
+  );
+  equal(store.lastJoin.title, "Learn Thai", "title must survive");
+  equal(store.lastJoin.language, "auto", "should fall back to the default");
+});
+
+await test("a bad language never reaches the Fireflies API", async () => {
+  // The join budget is 3 per 20 minutes; a rejected parse must not spend one.
+  store.lastJoin = null;
+  const before = store.telegram.length;
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: '/join https://teams.microsoft.com/meet/q3 "Sync" klingon' } })
+  );
+  equal(store.lastJoin, null, "no Fireflies call should have been made");
+  const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage");
+  assert(/don't recognise/.test(reply.body.text), `unexpected reply: ${reply.body.text}`);
+});
+
+await test("the join confirmation states which language was used", async () => {
+  const before = store.telegram.length;
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: '/join https://teams.microsoft.com/meet/q4 "Sync" en' } })
+  );
+  const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage");
+  assert(/language: en/.test(reply.body.text), `confirmation should name the language: ${reply.body.text}`);
 });
 
 await test("/join rejects something that is not a link", async () => {

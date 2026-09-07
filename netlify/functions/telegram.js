@@ -3,6 +3,7 @@ import { sendMessage, answerCallbackQuery, editMessageText } from "../../lib/tel
 import { findMeetingByFirefliesId, findSweepablePages } from "../../lib/notion.js";
 import { promoteMeeting, skipMeeting, triggerPromotions } from "../../lib/promote.js";
 import { addToLiveMeeting, FirefliesError } from "../../lib/fireflies.js";
+import { parseJoinCommand } from "../../lib/join.js";
 import { runAgent } from "../../lib/agent.js";
 
 // ---------------------------------------------------------------------------
@@ -24,7 +25,11 @@ import { runAgent } from "../../lib/agent.js";
 const HELP = [
   "I turn your Fireflies meetings into Notion recaps.",
   "",
-  "/join <meeting link> <title>  — send the Fireflies bot to a live meeting",
+  '/join <link> "<title>" <language>  — send the Fireflies bot to a live meeting',
+  '  e.g. /join https://... "Weekly sync" thai',
+  "  Quotes are the safe form: everything inside them is the title, the word",
+  "  after them is the language (thai, english, or a code like th, ja, zh-CN).",
+  "  Both are optional — without a language I let Fireflies auto-detect it.",
   "/sweep — process any meeting still waiting on a Yes/No answer",
   "/help — this message",
   "",
@@ -37,27 +42,22 @@ const HELP = [
 ].join("\n");
 
 async function handleJoin(argText) {
-  const trimmed = argText.trim();
-  if (!trimmed) {
-    return sendMessage("Usage: /join <meeting link> <title>");
-  }
+  const parsed = parseJoinCommand(argText);
+  if (parsed.error) return sendMessage(parsed.error);
 
-  const [linkPart, ...titleParts] = trimmed.split(/\s+/);
-  let link;
+  const { link, title, language } = parsed;
   try {
-    link = new URL(linkPart);
-    if (link.protocol !== "http:" && link.protocol !== "https:") throw new Error("not http");
-  } catch {
-    return sendMessage(`That doesn't look like a meeting link: ${linkPart}`);
-  }
-
-  const title = titleParts.join(" ").trim();
-  try {
-    const result = await addToLiveMeeting({ meeting_link: link.href, title: title || undefined });
+    const result = await addToLiveMeeting({ meeting_link: link, title: title || undefined, language });
     if (result?.success === false) {
       return sendMessage(`Fireflies refused to join: ${result.message || "no reason given"}`);
     }
-    return sendMessage(`Fireflies is joining${title ? ` "${title}"` : ""}. I'll ask about a recap when the transcript is ready.`);
+    // Echo the resolved language back: it is the only way to notice that a
+    // title was mis-read as a language, or vice versa, before the meeting ends.
+    const used = language || app.fireflies.defaultLanguage;
+    const languageNote = used === "auto" ? "auto-detecting the language" : `language: ${used}`;
+    return sendMessage(
+      `Fireflies is joining${title ? ` "${title}"` : ""} (${languageNote}). I'll ask about a recap when the transcript is ready.`
+    );
   } catch (err) {
     if (err instanceof FirefliesError && err.isRateLimited) {
       // No retry button: callback_data is capped at 64 bytes and a Teams link
@@ -79,11 +79,12 @@ async function handleSweep() {
   // Each promotion runs in its own background invocation rather than inline:
   // 20 transcripts back to back would not fit in this function's 15 minutes.
   // Every run reports its own result, so the reply here is just the receipt.
-  const triggered = await triggerPromotions(pending, { allowFailed: true });
-  const lines = [`Recapping ${triggered} meeting(s). I'll message you as each one lands.`];
-  for (const m of pending.slice(0, triggered)) lines.push(`- ${m.name}`);
-  if (triggered < pending.length) {
-    lines.push("", `${pending.length - triggered} could not be started — check the Netlify logs.`);
+  const { triggered, failed } = await triggerPromotions(pending, { allowFailed: true });
+  const lines = [`Recapping ${triggered.length} meeting(s). I'll message you as each one lands.`];
+  for (const m of triggered) lines.push(`- ${m.name}`);
+  if (failed.length) {
+    lines.push("", `${failed.length} could not be started — check the Netlify logs:`);
+    for (const m of failed) lines.push(`- ${m.name}`);
   }
   return sendMessage(lines.join("\n"));
 }

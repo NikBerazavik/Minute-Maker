@@ -19,11 +19,11 @@ export default async () => {
       return new Response(null, { status: 200 });
     }
 
-    const triggered = await triggerPromotions(pending);
-    console.log(`Sweep triggered ${triggered} of ${pending.length} promotion(s).`);
-    if (triggered > 0) {
+    const { triggered } = await triggerPromotions(pending);
+    console.log(`Sweep triggered ${triggered.length} of ${pending.length} promotion(s).`);
+    if (triggered.length > 0) {
       await sendMessage(
-        `Weekly sweep: ${triggered} meeting(s) were still waiting on a Yes/No, so I'm recapping them now.`
+        `Weekly sweep: ${triggered.length} meeting(s) were still waiting on a Yes/No, so I'm recapping them now.`
       ).catch(() => {});
     }
   } catch (err) {

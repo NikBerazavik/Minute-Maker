@@ -93,6 +93,42 @@ the first few real meetings should be treated as disposable test data.
 
 ---
 
+## The /join grammar
+
+```
+/join <link> "<title>" <language>
+```
+
+Quotes are the safe form — everything inside them is the title, and the single
+word after them is the language. Both parts are optional:
+
+| You type | Title | Language |
+|---|---|---|
+| `/join <link> "Weekly sync" thai` | Weekly sync | `th` |
+| `/join <link> "Weekly sync"` | Weekly sync | falls back to `FIREFLIES_LANGUAGE` |
+| `/join <link> "Learn Thai"` | Learn Thai | falls back — quotes protect the title |
+| `/join <link> Weekly sync thai` | Weekly sync | `th` |
+| `/join <link> Weekly sync` | Weekly sync | falls back |
+| `/join <link> "Sync" --lang zh-CN` | Sync | `zh-CN` |
+
+Accepted languages are the friendly words in `LANGUAGE_ALIASES`
+([lib/join.js](lib/join.js) — `thai`, `english`, `auto`, plus their codes) or
+any well-formed code up to 5 characters, which is Fireflies' limit.
+
+Two deliberate differences between the quoted and bare forms:
+
+- **Quoted**: the title's boundary is explicit, so a trailing word is
+  unambiguously a language. An unrecognised one is an **error** rather than
+  something folded back into the title — rejecting costs you a retype, while
+  guessing wrong costs one of only 3 joins per 20 minutes *and* transcribes a
+  meeting you cannot re-record in the wrong language.
+- **Bare**: only the alias table applies, never the general code shape. A bare
+  title can legitimately end in a two-letter word ("Roadmap for AI", "Plan B"),
+  and silently reading that as a language would be worse than ignoring it.
+
+The join confirmation always names the language it used, so a mis-parse is
+visible while the meeting is still running.
+
 ## Swapping the model, or the provider
 
 Every model call goes through `lib/llm.js`, which exposes one neutral shape and
@@ -113,6 +149,10 @@ OPENROUTER_API_KEY=...
 
 `LLM_EXTRACT_MODEL` overrides the model for transcript extraction only, so you
 can run a stronger model on recaps and a cheaper one on chat.
+
+Requests send `thinking: {type: "adaptive"}`, which is a Claude-5-family
+parameter. If you point `LLM_MODEL` at an older model (e.g. `claude-haiku-4-5`)
+it will reject that with a 400 — set `LLM_THINKING=off` in that case.
 
 > **The OpenRouter adapter is written but has never been run against the live
 > API.** Before trusting it with a real meeting, run `npm run test:llm` with
@@ -159,6 +199,7 @@ can run a stronger model on recaps and a cheaper one on chat.
 2. **Developer Settings** → webhook signing secret (16–32 chars) →
    `FIREFLIES_WEBHOOK_SECRET`.
 3. Leave the webhook URL until after the first deploy (step 6).
+4. `FIREFLIES_LANGUAGE` (optional, default `auto`) sets the transcription language passed to `addToLiveMeeting`. `auto` lets Fireflies detect it per meeting — better than Fireflies' own default (English) for a mixed-language team. See "The /join grammar" below for per-meeting overrides.
 
 ### 4. Anthropic
 
@@ -257,5 +298,6 @@ A recap costs a few cents of tokens. Everything else is inside the free tiers.
 | Notion 404 | The integration isn't connected to the database |
 | Notion 400 on write | A Status option doesn't exist; `npm run verify` compares them |
 | Extraction 400 on the tool schema | Set `LLM_STRICT_TOOLS=0` and redeploy |
+| 400 mentioning `thinking` after changing `LLM_MODEL` | That model predates adaptive thinking; set `LLM_THINKING=off` |
 | A page stuck in Processing | It clears itself after 30 minutes and the next sweep retries it |
 | A page in Failed | `/sweep` retries it; the scheduled sweep deliberately does not |

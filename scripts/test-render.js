@@ -20,6 +20,7 @@ import {
 import { normalizeExtraction, formatTranscript } from "../lib/extract.js";
 import { toApiMessages } from "../lib/llm/openrouter.js";
 import { verifySignature } from "../netlify/functions/fireflies.js";
+import { parseJoinCommand, resolveLanguage } from "../lib/join.js";
 
 let failures = 0;
 function test(name, fn) {
@@ -202,6 +203,121 @@ test("formatTranscript renders timestamps and skips empty lines", () => {
   equal(text.split("\n").length, 2, "line count");
   assert(text.startsWith("[1:05] Nik: Hello"), `bad first line: ${text.split("\n")[0]}`);
   assert(text.includes("[1:02:05] Unknown: Anonymous point"), "hour formatting or Unknown fallback wrong");
+});
+
+console.log("\n/join parsing");
+
+const LINK = "https://teams.microsoft.com/meet/491621134392563";
+const join = (text) => parseJoinCommand(text);
+
+test("quoted title with a language keeps them separate", () => {
+  const r = join(`${LINK} "Weekly sync" thai`);
+  equal(r.error, undefined, "should not error");
+  equal(r.title, "Weekly sync", "title");
+  equal(r.language, "th", "language");
+  equal(r.link, LINK, "link");
+});
+
+test("quoted title with no language leaves the language unset", () => {
+  const r = join(`${LINK} "Weekly sync"`);
+  equal(r.title, "Weekly sync", "title");
+  equal(r.language, null, "language should be unset, letting the config default apply");
+});
+
+test("quotes protect a title that ends in a language word", () => {
+  // The exact case bare parsing gets wrong.
+  const r = join(`${LINK} "Learn Thai"`);
+  equal(r.title, "Learn Thai", "title must survive intact");
+  equal(r.language, null, "no language should be taken from inside the quotes");
+});
+
+test("smart quotes from an iOS keyboard are accepted", () => {
+  const r = join(`${LINK} \u201CBoard review\u201D english`);
+  equal(r.title, "Board review", "title");
+  equal(r.language, "en", "language");
+});
+
+test("single quotes work too", () => {
+  const r = join(`${LINK} 'Board review' th`);
+  equal(r.title, "Board review", "title");
+  equal(r.language, "th", "language");
+});
+
+test("an unterminated quote is an error, not a guess", () => {
+  const r = join(`${LINK} "Weekly sync`);
+  assert(/never closed it/.test(r.error || ""), `expected a quote error, got: ${JSON.stringify(r)}`);
+});
+
+test("junk after a quoted title is rejected rather than silently ignored", () => {
+  const r = join(`${LINK} "Weekly sync" with the platform team`);
+  assert(/couldn't tell what/.test(r.error || ""), `expected an error, got: ${JSON.stringify(r)}`);
+});
+
+test("an unknown language after a quoted title is rejected", () => {
+  // Rejecting protects the 3-per-20-minute join budget from being spent on a
+  // meeting that would be transcribed in the wrong language.
+  const r = join(`${LINK} "Weekly sync" klingon`);
+  assert(/don't recognise/.test(r.error || ""), `expected an error, got: ${JSON.stringify(r)}`);
+});
+
+test("an unlisted but well-formed code passes through after a quoted title", () => {
+  equal(join(`${LINK} "Sync" ja`).language, "ja", "ja");
+  equal(join(`${LINK} "Sync" zh-CN`).language, "zh-CN", "region subtag case preserved");
+});
+
+test("a code longer than Fireflies allows is rejected, never truncated", () => {
+  const r = join(`${LINK} "Sync" es-419`);
+  assert(/at most 5 characters/.test(r.error || ""), `expected a length error, got: ${JSON.stringify(r)}`);
+});
+
+test("bare title with a trailing language word still works", () => {
+  const r = join(`${LINK} Weekly sync thai`);
+  equal(r.title, "Weekly sync", "title");
+  equal(r.language, "th", "language");
+});
+
+test("bare title without a language word is left whole", () => {
+  const r = join(`${LINK} Ordinary meeting title`);
+  equal(r.title, "Ordinary meeting title", "title");
+  equal(r.language, null, "language");
+});
+
+test("bare parsing ignores code-shaped words that are not aliases", () => {
+  // "AI" is a valid-looking code but almost certainly part of the title.
+  const r = join(`${LINK} Roadmap for AI`);
+  equal(r.title, "Roadmap for AI", "title must be left alone");
+  equal(r.language, null, "language");
+});
+
+test("--lang works in both the quoted and bare forms", () => {
+  equal(join(`${LINK} "Sync" --lang ja`).language, "ja", "quoted");
+  const bare = join(`${LINK} Sync meeting --lang ja`);
+  equal(bare.language, "ja", "bare");
+  equal(bare.title, "Sync meeting", "--lang must not leak into the title");
+});
+
+test("--lang with no value is an error", () => {
+  assert(/No language given/.test(join(`${LINK} Sync --lang`).error || ""), "bare form");
+  assert(/exactly one language/.test(join(`${LINK} "Sync" --lang`).error || ""), "quoted form");
+});
+
+test("a missing or malformed link is rejected", () => {
+  assert(/doesn't look like a meeting link/.test(join("not-a-link Weekly sync").error || ""), "not a url");
+  assert(/doesn't look like a meeting link/.test(join("ftp://x.com Weekly").error || ""), "wrong protocol");
+  assert(/Usage/.test(join("").error || ""), "empty");
+});
+
+test("a link with no title at all is valid", () => {
+  const r = join(LINK);
+  equal(r.title, "", "title");
+  equal(r.language, null, "language");
+  equal(r.link, LINK, "link");
+});
+
+test("resolveLanguage maps aliases case-insensitively", () => {
+  equal(resolveLanguage("THAI").code, "th", "THAI");
+  equal(resolveLanguage(" English ").code, "en", "padded English");
+  equal(resolveLanguage("auto").code, "auto", "auto");
 });
 
 console.log("\nWebhook signature");
