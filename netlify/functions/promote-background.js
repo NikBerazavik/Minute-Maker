@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { config as app } from "../../lib/config.js";
 import { promoteMeeting } from "../../lib/promote.js";
+import { completeNotes } from "../../lib/notes.js";
 
 // ---------------------------------------------------------------------------
 // Runs one meeting's promotion in its own invocation, so the scheduled sweep
@@ -31,14 +32,23 @@ export default async (req) => {
       return accepted;
     }
 
-    const { page_id, allow_failed } = await req.json();
+    const { page_id, allow_failed, mode, tier, backstop } = await req.json();
     if (!page_id) {
       console.warn("/promote called with no page_id.");
       return accepted;
     }
-    // promoteMeeting handles its own failures and never throws, which matters
-    // here: a thrown error would make Netlify retry the extraction twice more.
-    await promoteMeeting(page_id, { allowFailed: Boolean(allow_failed) });
+    // Both of these handle their own failures and never throw, which matters
+    // here: a thrown error would make Netlify retry the whole run twice more.
+    //
+    // mode "notes" is the zero-model path — meeting.summarized and the sweep's
+    // 24-hour backstop both arrive here. Anything else is an LLM tier; an
+    // absent tier resolves to the default (Haiku), which is what both sweeps
+    // send.
+    if (mode === "notes") {
+      await completeNotes(page_id, { backstop: Boolean(backstop) });
+    } else {
+      await promoteMeeting(page_id, { allowFailed: Boolean(allow_failed), tier });
+    }
   } catch (err) {
     console.error("/promote failed:", err);
   }

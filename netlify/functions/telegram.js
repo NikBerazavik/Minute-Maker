@@ -1,8 +1,10 @@
-import { config as app } from "../../lib/config.js";
+import { config as app, resolveTier, isTierKey } from "../../lib/config.js";
 import { sendMessage, answerCallbackQuery, editMessageText } from "../../lib/telegram.js";
 import { findMeetingByFirefliesId, findSweepablePages } from "../../lib/notion.js";
 import { promoteMeeting, skipMeeting, triggerPromotions } from "../../lib/promote.js";
+import { notesRecap } from "../../lib/notes.js";
 import { addToLiveMeeting, getUsage, FirefliesError } from "../../lib/fireflies.js";
+import { formatReport } from "../../lib/usage.js";
 import { parseJoinCommand } from "../../lib/join.js";
 import { runAgent } from "../../lib/agent.js";
 
@@ -30,11 +32,18 @@ const HELP = [
   "  Quotes are the safe form: everything inside them is the title, the word",
   "  after them is the language (thai, english, or a code like th, ja, zh-CN).",
   "  Both are optional — without a language I let Fireflies auto-detect it.",
-  "/sweep — process any meeting still waiting on a Yes/No answer",
+  "/sweep — process any meeting still waiting on an answer",
   "/space — how much Fireflies transcription storage is left",
   "/help — this message",
   "",
-  "When a transcript is ready I'll ask whether you want a recap. Tap Yes or No.",
+  "When a transcript is ready I'll ask how to recap it, and tell you how much",
+  "Fireflies storage is left. Four buttons:",
+  "  Haiku  — a model recap, cheap. The default for /sweep and the weekly job.",
+  "  Sonnet — a model recap, better at long or messy meetings.",
+  "  Notes  — no model at all: Fireflies' own summary, in the meeting's own",
+  "           language. Free. If Fireflies hasn't finished summarising yet I",
+  "           claim the page and finish it the moment it does.",
+  "  Skip   — no recap; the page stays as a record that the meeting happened.",
   "",
   "Anything else you type, I answer from your meeting notes:",
   '- "what did we decide about the 5G report?"',
@@ -87,24 +96,9 @@ async function handleSpace() {
     return sendMessage(`Could not read your Fireflies usage: ${err.message}`);
   }
 
-  const cap = app.fireflies.minutesAllowance;
-  const used = usage.minutesConsumed;
-  const left = Math.max(0, cap - used);
-  // Floor, not round: 398 of 400 must not read "100%" next to "2 minutes left".
-  const percent = cap > 0 ? Math.floor((used / cap) * 100) : 0;
-
-  const lines = [
-    `Fireflies storage: ${Math.round(used)} of ${cap} minutes used (${percent}%).`,
-    `${Math.round(left)} minutes left, across ${usage.transcripts} transcript(s).`,
-  ];
-  if (used >= app.fireflies.minutesWarnAt) {
-    lines.push(
-      "",
-      `That is past the ${app.fireflies.minutesWarnAt}-minute mark — clear some transcripts in Fireflies soon.`,
-      "Anything already recapped into Notion is safe to delete there."
-    );
-  }
-  return sendMessage(lines.join("\n"));
+  // Shared with the line on the transcribed prompt, so the "running out"
+  // warning cannot appear in one and not the other.
+  return sendMessage(formatReport(usage));
 }
 
 async function handleSweep() {
@@ -127,25 +121,44 @@ async function handleSweep() {
 }
 
 async function handleCallback(callbackQuery) {
-  const [action, meetingId] = String(callbackQuery.data || "").split(":");
+  const [rawAction, meetingId] = String(callbackQuery.data || "").split(":");
   const chatId = callbackQuery.message?.chat?.id;
   const messageId = callbackQuery.message?.message_id;
 
+  // A prompt sitting in scrollback from before the tiers shipped still sends
+  // "yes:". Map it to the default tier rather than answering "Unrecognised".
+  const action = rawAction === "yes" ? app.extractTiers[0].key : rawAction;
+  const tier = isTierKey(action) ? resolveTier(action) : null;
+
   // Always answer, or the client shows a spinner until it times out.
-  await answerCallbackQuery(callbackQuery.id, action === "yes" ? "Working on it" : "Skipping");
+  await answerCallbackQuery(callbackQuery.id, tier ? `Working on it — ${tier.label}` : "Skipping");
 
   const meeting = await findMeetingByFirefliesId(meetingId);
   if (!meeting) {
     return editMessageText(chatId, messageId, `No Notion page found for meeting ${meetingId}.`);
   }
 
-  // Editing without reply_markup removes the keyboard, so the prompt cannot be
-  // tapped twice while the extraction runs.
-  if (action === "yes") {
-    await editMessageText(chatId, messageId, `Yes — building the recap for "${meeting.name}"...`);
-    const result = await promoteMeeting(meeting.page_id);
+  if (tier) {
+    // Editing without reply_markup removes the keyboard, so the prompt cannot
+    // be tapped twice while the work runs. That is a UI defence only — it does
+    // not survive a redelivery or a second device — so the real guard is the
+    // state check inside promoteMeeting/notesRecap.
+    await editMessageText(chatId, messageId, `${tier.label} — building the recap for "${meeting.name}"...`);
+
+    const result =
+      tier.key === "notes"
+        ? await notesRecap(meeting.page_id)
+        : await promoteMeeting(meeting.page_id, { tier: tier.key });
+
     if (result.skipped) {
       await sendMessage(`Nothing to do: that meeting ${result.reason}.`);
+    } else if (result.waiting) {
+      await sendMessage(
+        `Fireflies hasn't finished its notes for "${meeting.name}" yet. ` +
+          `I've claimed the page and I'll finish it the moment they land` +
+          `${result.reason ? ` (${result.reason})` : ""}. ` +
+          `Tap Haiku or Sonnet on that meeting if you'd rather not wait.`
+      );
     }
     return;
   }
@@ -159,7 +172,7 @@ async function handleCallback(callbackQuery) {
     );
   }
 
-  return editMessageText(chatId, messageId, `Unrecognised action "${action}".`);
+  return editMessageText(chatId, messageId, `Unrecognised action "${rawAction}".`);
 }
 
 async function handleMessage(text) {

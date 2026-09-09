@@ -9,7 +9,7 @@
 // ---------------------------------------------------------------------------
 
 import { config } from "../lib/config.js";
-import { notionRequest, meetingsSourceId, meetingsSchema, searchMeetings } from "../lib/notion.js";
+import { notionRequest, meetingsSourceId, meetingsSchema, searchMeetings, findSweepablePages } from "../lib/notion.js";
 import { whoAmI } from "../lib/fireflies.js";
 import { getMe } from "../lib/telegram.js";
 import { today, nowLocal } from "../lib/dates.js";
@@ -45,6 +45,27 @@ await check("Environment variables present", () => {
 });
 await check("Local time resolves", () => `${nowLocal()} (today = ${today()})`);
 
+// Printed rather than merely checked: a mistyped LLM_MODEL_HAIKU is invisible
+// until a real meeting 400s, and this is the last moment before deploy where
+// the resolved values can be read at a glance.
+await check("Extraction tiers resolve", () => {
+  const override = process.env.LLM_EXTRACT_MODEL;
+  const rows = config.extractTiers.map((t) => {
+    if (!t.model) return `${t.label}: no model (writes "${t.extractedBy}")`;
+    const model = override || t.model;
+    const thinking = t.thinking && t.thinking !== "off" ? t.thinking : "off";
+    return `${t.label}: ${model} (thinking ${thinking})`;
+  });
+  if (override) rows.push(`LLM_EXTRACT_MODEL is overriding both model tiers with "${override}"`);
+  const haiku = config.extractTiers.find((t) => t.key === "haiku");
+  // The failure that shipped this whole per-tier design: Haiku 4.5 rejects
+  // "adaptive" with a 400 on the first call.
+  if (haiku && /haiku/i.test(haiku.model) && haiku.thinking !== "off") {
+    throw new Error(`the Haiku tier has thinking "${haiku.thinking}"; Haiku models reject anything but off`);
+  }
+  return `default is ${config.extractTiers[0].label} — ${rows.join("; ")}`;
+});
+
 console.log("\nNotion");
 await check("Token is valid", async () => {
   const me = await notionRequest("/users/me");
@@ -57,7 +78,14 @@ await check("Meetings database reachable", async () => {
 await check("Schema matches config", async () => {
   const schema = await meetingsSchema();
   const actual = Object.keys(schema);
-  const expected = [config.props.name, config.props.date, config.props.sourceId, config.props.status];
+  const expected = [
+    config.props.name,
+    config.props.date,
+    config.props.sourceId,
+    config.props.status,
+    config.props.extractionState,
+    config.props.extractedBy,
+  ];
   const missing = expected.filter((p) => !actual.includes(p));
   if (missing.length) throw new Error(`missing propertie(s): ${missing.join(", ")}`);
 
@@ -66,6 +94,12 @@ await check("Schema matches config", async () => {
     [config.props.date]: ["date"],
     [config.props.sourceId]: ["rich_text"],
     [config.props.status]: ["select", "status"],
+    // Select, deliberately not Notion's Status type: no lifecycle grouping is
+    // wanted, and a Select auto-creates a missing option on write.
+    [config.props.extractionState]: ["select"],
+    // rich_text, never a Select: model ids change every release and dead
+    // Select options would pile up forever.
+    [config.props.extractedBy]: ["rich_text"],
   };
   for (const [prop, allowed] of Object.entries(types)) {
     if (!allowed.includes(schema[prop].type)) {
@@ -87,6 +121,29 @@ await check("Status options exist", async () => {
     warn(`Select is missing options (Notion will create them on first write): ${missing.join(", ")}`);
   }
   return options.join(", ") || "(none yet)";
+});
+await check("Extraction State option matches config", async () => {
+  const schema = await meetingsSchema();
+  const options = (schema[config.props.extractionState]?.select?.options || []).map((o) => o.name);
+  const wanted = config.extractionState.pendingNotes;
+
+  // A stray option from an earlier spelling is harmless — the same literal is
+  // written and queried — but it will confuse you in the Notion UI later.
+  const strays = options.filter((o) => o !== wanted);
+  if (strays.length) warn(`unused Extraction State option(s) — safe to delete in Notion: ${strays.join(", ")}`);
+  if (!options.includes(wanted)) {
+    warn(`"${wanted}" does not exist yet (Notion will create it on the first Notes tap)`);
+  }
+  return `using "${wanted}"`;
+});
+await check("Sweep filter excludes claimed pages", async () => {
+  // Cheap live proof of the one failure that is silent in the worst direction:
+  // if the Extraction State exclusion were wrong, this query would match
+  // nothing and the sweep would quietly stop recapping anything at all.
+  const pages = await findSweepablePages({ includeFailed: true, limit: 5 });
+  const claimed = pages.filter((p) => p.extraction_state === config.extractionState.pendingNotes);
+  if (claimed.length) throw new Error(`${claimed.length} claimed page(s) came back — the sweep would hijack them`);
+  return `${pages.length} page(s) currently sweepable`;
 });
 await check("Can query the database", async () => {
   const meetings = await searchMeetings({ limit: 3 });
