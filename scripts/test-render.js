@@ -10,6 +10,9 @@ import crypto from "node:crypto";
 import { config } from "../lib/config.js";
 import {
   renderBlocks,
+  renderNotesBlocks,
+  parseFirefliesActionItems,
+  parseFirefliesNotes,
   chunkText,
   chunkArray,
   blocksToText,
@@ -377,6 +380,177 @@ test("tool_use becomes tool_calls and tool_result becomes a tool message", () =>
   equal(mapped[3].role, "tool", "tool result role");
   equal(mapped[3].tool_call_id, "t1", "tool_call_id");
   assert(!JSON.stringify(mapped).includes("thinking"), "opaque blocks must be dropped");
+});
+
+
+// ---------------------------------------------------------------------------
+// The Notes tier's parsers.
+//
+// These read text a model wrote for a human, not a validated schema, so the
+// contract is "degrade, never throw". Every malformed case below must produce
+// SOMETHING rather than an exception — a thrown error here would mark a page
+// Failed over a summary that was merely oddly shaped.
+//
+// The fixtures are the real shapes the live account returns, trailing
+// hard-break spaces and all.
+// ---------------------------------------------------------------------------
+
+console.log("\nFireflies action items");
+
+const ACTION_ITEMS = `**Thanachai Chuklin**  
+ประสานทีมจัดการประชุมแก้ไข feedback (04:14)  
+ติดตามแก้ไข logic AI (24:58)  
+
+**tanawoot**  
+แจก user ทีม Call Center เล่น UAT (05:47)  `;
+
+test("owner headers are attached to the tasks below them", () => {
+  const items = parseFirefliesActionItems(ACTION_ITEMS);
+  equal(items.length, 3, "item count");
+  equal(items[0].owner, "Thanachai Chuklin", "first owner");
+  equal(items[1].owner, "Thanachai Chuklin", "the owner carries to the next line");
+  equal(items[2].owner, "tanawoot", "second owner");
+});
+
+test("timestamps are kept and hard-break spaces are trimmed", () => {
+  const items = parseFirefliesActionItems(ACTION_ITEMS);
+  // The (mm:ss) marker is the only way back to that moment in the recording.
+  equal(items[0].content, "ประสานทีมจัดการประชุมแก้ไข feedback (04:14)", "content");
+  assert(!/\s$/.test(items[0].content), "trailing hard-break spaces must be gone");
+});
+
+test("an item with no owner header falls back to TBA", () => {
+  const items = parseFirefliesActionItems("Do the thing (01:00)");
+  equal(items[0].owner, "TBA", "matches what the LLM tier writes for an unowned action");
+});
+
+test("bullet markers and stray emphasis are stripped", () => {
+  const items = parseFirefliesActionItems("**Nik**\n- **Send the draft** (02:00)");
+  equal(items[0].content, "Send the draft (02:00)", "content");
+});
+
+test("action items degrade rather than throw", () => {
+  for (const bad of [null, undefined, "", "   ", "**", "****", "\n\n\n", 42, {}]) {
+    const items = parseFirefliesActionItems(bad);
+    assert(Array.isArray(items), `expected an array for ${JSON.stringify(bad)}`);
+  }
+});
+
+console.log("\nFireflies structured notes");
+
+const NOTES = `## การทดสอบ UAT และ POV
+
+- เริ่ม UAT ด้วย 3 user (03:42)
+    - ใช้ลิงก์ TrueConnect เดิม
+    - ให้ทีมลองเล่นและเก็บ feedback
+- POV ยังไม่เริ่มวันนี้ (05:45)
+
+## ปัญหาเนื้อหาและ UI
+
+- คำตอบ AI ข้อมูลเยอะ (14:09)`;
+
+test("headings become sections and indented bullets become children", () => {
+  const sections = parseFirefliesNotes(NOTES);
+  equal(sections.length, 2, "section count");
+  equal(sections[0].title, "การทดสอบ UAT และ POV", "first heading");
+  equal(sections[0].items.length, 2, "top-level items");
+  equal(sections[0].items[0].children.length, 2, "children of the first item");
+  equal(sections[0].items[1].children.length, 0, "the second item has none");
+  equal(sections[1].items.length, 1, "second section");
+});
+
+test("content before any heading lands in an untitled section", () => {
+  const sections = parseFirefliesNotes("- loose point\n- another");
+  equal(sections.length, 1, "section count");
+  equal(sections[0].title, null, "no heading should be invented");
+  equal(sections[0].items.length, 2, "items");
+});
+
+test("a non-bullet line is still kept, not dropped", () => {
+  const sections = parseFirefliesNotes("## Topic\n\nA plain sentence.");
+  equal(sections[0].items[0].content, "A plain sentence.", "content");
+});
+
+test("an indented line with nothing above it does not become an orphan child", () => {
+  const sections = parseFirefliesNotes("## Topic\n\n    - deeply indented first");
+  equal(sections[0].items.length, 1, "it must become a top-level item instead");
+});
+
+test("structured notes degrade rather than throw", () => {
+  for (const bad of [null, undefined, "", "###", "- ", "\t\t", 7, []]) {
+    assert(Array.isArray(parseFirefliesNotes(bad)), `expected an array for ${JSON.stringify(bad)}`);
+  }
+});
+
+console.log("\nNotes page rendering");
+
+const FULL = { summary: "The team reviewed policy coverage.", actionItems: ACTION_ITEMS, notes: NOTES };
+
+test("a Notes page has the same skeleton as a model page", () => {
+  const blocks = renderNotesBlocks(FULL);
+  const headings = headingTexts(blocks);
+  equal(headings[0], config.text.summaryHeading, "Summary comes first");
+  equal(headings[1], config.text.actionsHeading, "then the action rollup");
+  assert(headings.includes("การทดสอบ UAT และ POV"), "then one heading per topic");
+  // Same skeleton as renderBlocks() produces, so the two tiers read alike.
+  const llm = headingTexts(renderBlocks({ summary: "s", topics: [{ title: "T", notes: [{ content: "c", is_action_item: true, action_owner: "N" }] }] }));
+  equal(llm[0], headings[0], "summary heading must match the LLM tier");
+  equal(llm[1], headings[1], "action heading must match the LLM tier");
+});
+
+test("action bullets are formatted by the same helper as the LLM tier", () => {
+  const bullets = bulletTexts(renderNotesBlocks({ actionItems: "**Joao**\nSend the draft (45:00)" }));
+  equal(bullets[0], actionLine({ content: "Send the draft (45:00)", action_owner: "Joao" }), "format must be identical");
+});
+
+test("prose is rendered as paragraphs, a bullet list as bullets", () => {
+  const prose = renderNotesBlocks({ summary: "One sentence.\n\nAnother one." });
+  equal(prose.filter((b) => b.type === "paragraph").length, 2, "two paragraphs");
+  // `overview` comes back as a bold-bullet list on this account; dumping that
+  // into a paragraph would show raw "- **x**" on the page.
+  const listy = renderNotesBlocks({ summary: "- **first point**\n- **second point**" });
+  equal(bulletTexts(listy).length, 2, "bullet-shaped summary should render as bullets");
+  equal(bulletTexts(listy)[0], "first point", "emphasis and marker stripped");
+});
+
+test("nested items become Notion child blocks", () => {
+  const blocks = renderNotesBlocks({ notes: NOTES });
+  const parent = blocks.find((b) => b.bulleted_list_item?.rich_text?.[0]?.text.content.startsWith("เริ่ม UAT"));
+  equal(parent.bulleted_list_item.children.length, 2, "children attached");
+  equal(parent.bulleted_list_item.children[0].type, "bulleted_list_item", "child block type");
+});
+
+test("an empty summary renders no blocks at all", () => {
+  // The caller reads [] as "Fireflies has not finished summarising yet", so an
+  // empty result must not accidentally produce a heading with nothing under it.
+  equal(renderNotesBlocks({}).length, 0, "empty object");
+  equal(renderNotesBlocks({ summary: "", actionItems: "  ", notes: null }).length, 0, "blank fields");
+  equal(renderNotesBlocks().length, 0, "no argument at all");
+});
+
+test("a partial summary still produces a usable page", () => {
+  const onlyActions = renderNotesBlocks({ actionItems: ACTION_ITEMS });
+  assert(headingTexts(onlyActions).includes(config.text.actionsHeading), "action items alone should still render");
+  assert(!headingTexts(onlyActions).includes(config.text.summaryHeading), "no empty Summary heading");
+});
+
+test("long Notes content is chunked to Notion's limits like everything else", () => {
+  const blocks = renderNotesBlocks({ summary: "x".repeat(RICH_TEXT_LIMIT * 2 + 50) });
+  for (const b of blocks) {
+    for (const rt of b[b.type].rich_text || []) {
+      assert(rt.text.content.length <= RICH_TEXT_LIMIT, `piece of ${rt.text.content.length} exceeds the limit`);
+    }
+  }
+});
+
+test("blocksToText indents resolved child blocks", () => {
+  const parent = renderNotesBlocks({ notes: "## T\n\n- parent\n    - child" }).at(-1);
+  // read_meeting attaches children as _children; without them the sub-bullet
+  // would be invisible to the chat agent.
+  const withKids = { ...parent, _children: parent.bulleted_list_item.children };
+  const text = blocksToText([withKids]);
+  assert(/- parent/.test(text), "parent line");
+  assert(/ {2}- child/.test(text), `child should be indented: ${JSON.stringify(text)}`);
 });
 
 console.log(failures === 0 ? "\nAll offline tests passed.\n" : `\n${failures} test(s) failed.\n`);

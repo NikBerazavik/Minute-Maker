@@ -59,19 +59,36 @@ const store = {
   transcriptFetches: 0,
   transcriptExists: true,
   lastJoin: null, // variables sent on the last addToLiveMeeting call
+  summaryFetches: 0, // Notes-tier summary queries
+  summaryFields: null, // the field list the last summary query asked for
+  summary: null, // what Fireflies' summary query returns; null = not ready yet
+  rejectSummaryFields: [], // fields the fake schema does not have
+  usageFails: null, // set to an Error to make the usage query fail
+  usageHangs: false, // never resolves, to prove the timeout works
+  extractRequests: [], // Anthropic request bodies for extract_meeting
 };
+
+// "Status" is legitimately either a Select or Notion's dedicated Status type
+// depending on how the database was built by hand, and the two have different
+// write AND filter shapes. The live database this project runs against is the
+// Status kind, so the whole suite runs twice — once as each — rather than
+// covering only the shape the mock happened to be written with.
+const STATUS_TYPE = process.env.FLOW_STATUS_TYPE === "status" ? "status" : "select";
+const STATUS_OPTIONS = [{ name: "Pending" }, { name: "Processing" }, { name: "Done" }, { name: "Skipped" }, { name: "Failed" }];
 
 const SCHEMA = {
   Name: { type: "title" },
   Date: { type: "date" },
   "Source Meeting ID": { type: "rich_text" },
-  Status: {
-    type: "select",
-    select: { options: [{ name: "Pending" }, { name: "Processing" }, { name: "Done" }, { name: "Skipped" }, { name: "Failed" }] },
-  },
+  Status: { type: STATUS_TYPE, [STATUS_TYPE]: { options: STATUS_OPTIONS } },
+  "Extraction State": { type: "select", select: { options: [{ name: "Pending Notes" }] } },
+  "Extracted By": { type: "rich_text" },
 };
 
-const readStatus = (page) => page.properties.Status?.select?.name || null;
+const readStatus = (page) => page.properties.Status?.select?.name ?? page.properties.Status?.status?.name ?? null;
+const readState = (page) => page.properties["Extraction State"]?.select?.name || null;
+const readExtractedBy = (page) =>
+  (page.properties["Extracted By"]?.rich_text || []).map((r) => r.plain_text ?? r.text?.content).join("") || null;
 const readSourceId = (page) => (page.properties["Source Meeting ID"]?.rich_text || []).map((r) => r.plain_text ?? r.text?.content).join("");
 const readTitle = (page) => (page.properties.Name?.title || []).map((r) => r.plain_text ?? r.text?.content).join("");
 
@@ -94,10 +111,48 @@ function matchesFilter(page, filter) {
     return new Date(page.last_edited_time) < new Date(filter.last_edited_time.before);
   }
   if (filter.property === "Source Meeting ID") return readSourceId(page) === filter.rich_text.equals;
-  if (filter.property === "Status") return readStatus(page) === filter.select.equals;
+  if (filter.property === "Status") {
+    // A Status property filters with `status:`, a Select with `select:`. Reading
+    // whichever arrived is what proves statusFilter() picked the right one.
+    const clause = filter.status || filter.select;
+    if (!clause) throw new Error(`mock: Status filter has neither status nor select: ${JSON.stringify(filter)}`);
+    if (STATUS_TYPE === "status" && !filter.status) throw new Error("mock: a Status property must be filtered with `status:`");
+    if (STATUS_TYPE === "select" && !filter.select) throw new Error("mock: a Select property must be filtered with `select:`");
+    return readStatus(page) === clause.equals;
+  }
+  if (filter.property === "Extraction State") {
+    const value = readState(page);
+    const f = filter.select;
+    if ("equals" in f) return value === f.equals;
+    // Notion's does_not_equal on a Select does NOT match a row whose Select is
+    // empty. Modelling that faithfully is the whole point of this branch: get
+    // it wrong here and the sweep-exclusion test passes against a mock that is
+    // more forgiving than the real API, which is worse than having no test.
+    if ("does_not_equal" in f) return value !== null && value !== f.does_not_equal;
+    if ("is_empty" in f) return f.is_empty === (value === null);
+    if ("is_not_empty" in f) return f.is_not_empty === (value !== null);
+    throw new Error(`mock: unhandled Extraction State filter ${JSON.stringify(f)}`);
+  }
   if (filter.property === "Name") return readTitle(page).toLowerCase().includes(String(filter.title.contains).toLowerCase());
   if (filter.property === "Date") return true;
   throw new Error(`mock: unhandled filter ${JSON.stringify(filter)}`);
+}
+
+/**
+ * Notion allows at most TWO levels of and/or nesting and answers a third with a
+ * 400. The mock happily evaluated three, so a filter that could never work in
+ * production passed every offline test and was only caught by `npm run verify`
+ * against the live database. Asserting the limit here keeps that class of bug
+ * offline where it belongs.
+ */
+function assertFilterDepth(filter, depth = 0) {
+  if (!filter || typeof filter !== "object") return;
+  const compound = filter.and || filter.or;
+  if (!compound) return;
+  if (depth >= 2) {
+    throw new Error(`mock: filter nests and/or ${depth + 1} levels deep; Notion allows 2 and 400s on more`);
+  }
+  for (const child of compound) assertFilterDepth(child, depth + 1);
 }
 
 const json = (body, status = 200) =>
@@ -124,6 +179,7 @@ globalThis.fetch = async (url, options = {}) => {
     if (method === "GET" && path === "/data_sources/ds-1") return json({ properties: SCHEMA });
 
     if (method === "POST" && path === "/data_sources/ds-1/query") {
+      assertFilterDepth(body.filter);
       const results = [...store.pages.values()].filter((p) => matchesFilter(p, body.filter));
       return json({ results: results.slice(0, body.page_size || 25), has_more: false, next_cursor: null });
     }
@@ -176,7 +232,23 @@ globalThis.fetch = async (url, options = {}) => {
           // that so the mock cannot pass code that only handles the write shape.
           const stored = JSON.parse(JSON.stringify(block));
           for (const rt of stored[stored.type]?.rich_text || []) rt.plain_text = rt.text.content;
-          existing.push({ id: `${pageId}-b${existing.length}`, ...stored });
+          const id = `${pageId}-b${existing.length}`;
+          // Notion stores nested blocks as children of the BLOCK, reachable
+          // only through a second request, and reports has_children on the
+          // parent. Model that or a nesting bug would pass unnoticed.
+          const nested = stored[stored.type]?.children || [];
+          if (nested.length) {
+            delete stored[stored.type].children;
+            store.children.set(
+              id,
+              nested.map((c, i) => {
+                const child = JSON.parse(JSON.stringify(c));
+                for (const rt of child[child.type]?.rich_text || []) rt.plain_text = rt.text.content;
+                return { id: `${id}-c${i}`, ...child };
+              })
+            );
+          }
+          existing.push({ id, has_children: nested.length > 0, ...stored });
         }
         store.children.set(pageId, existing);
         return json({ results: body.children });
@@ -207,7 +279,42 @@ globalThis.fetch = async (url, options = {}) => {
     }
     if (body.query.includes("minutes_consumed")) {
       store.usageFetches++;
+      if (store.usageHangs) {
+        // Never resolves on its own — only the AbortController can end this.
+        return new Promise((_, reject) => {
+          options.signal?.addEventListener("abort", () => {
+            const err = new Error("aborted");
+            err.name = "AbortError";
+            reject(err);
+          });
+        });
+      }
+      if (store.usageFails) throw store.usageFails;
       return json({ data: { user: { minutes_consumed: store.minutesConsumed, num_transcripts: 7 } } });
+    }
+    if (body.query.includes("summary {")) {
+      store.summaryFetches++;
+      const asked = body.query.match(/summary \{([^}]*)\}/)[1].trim().split(/\s+/);
+      store.summaryFields = asked;
+      const rejected = asked.filter((f) => store.rejectSummaryFields.includes(f));
+      if (rejected.length) {
+        return json({
+          errors: rejected.map((f) => ({ message: `Cannot query field "${f}" on type "Summary".` })),
+        });
+      }
+      const summary = store.summary
+        ? Object.fromEntries(asked.filter((f) => f in store.summary).map((f) => [f, store.summary[f]]))
+        : null;
+      return json({
+        data: {
+          transcript: {
+            id: body.variables.id,
+            title: "UAT for CC AI",
+            date: Date.parse("2026-09-01T07:15:00Z"),
+            summary,
+          },
+        },
+      });
     }
     if (body.query.includes("transcript(")) {
       store.transcriptFetches++;
@@ -252,6 +359,7 @@ globalThis.fetch = async (url, options = {}) => {
     }
 
     store.llmCalls++;
+    store.extractRequests.push(body);
     equal(body.tool_choice?.type, "tool", "mock: extraction must force the tool call");
     return json({
       id: "msg_1",
@@ -331,7 +439,7 @@ await test("rejects an unsigned request with 401", async () => {
   equal(store.pages.size, 0, "no page should have been created");
 });
 
-await test("creates a stub page and sends a Yes/No prompt", async () => {
+await test("creates a stub page and sends the four-button tier prompt", async () => {
   const res = await firefliesFn(firefliesRequest(transcribedPayload));
   equal(res.status, 200, "status");
   equal(store.pages.size, 1, "page count");
@@ -345,17 +453,28 @@ await test("creates a stub page and sends a Yes/No prompt", async () => {
 
   const prompt = lastTelegram("sendMessage");
   assert(prompt.body.reply_markup, "prompt has no inline keyboard");
-  const buttons = prompt.body.reply_markup.inline_keyboard[0];
-  equal(buttons[0].callback_data, `yes:${MEETING_ID}`, "yes callback_data");
-  assert(Buffer.byteLength(buttons[0].callback_data) <= 64, "callback_data exceeds Telegram's 64-byte limit");
+  const rows = prompt.body.reply_markup.inline_keyboard;
+  equal(rows.length, 2, "expected a 2x2 grid");
+  const keys = rows.flat().map((b) => b.callback_data.split(":")[0]);
+  equal(keys.join(","), "haiku,sonnet,notes,no", "button order");
+  for (const b of rows.flat()) {
+    assert(Buffer.byteLength(b.callback_data) <= 64, `callback_data "${b.callback_data}" exceeds Telegram's 64 bytes`);
+  }
+
+  // The storage meter rides along on the prompt — this is the "how many of my
+  // 400 minutes are left" report, delivered once per transcribed meeting.
+  assert(/Storage: 236 of 400 minutes left\./.test(prompt.body.text), `no storage line: ${prompt.body.text}`);
+  equal(store.usageFetches, 1, "exactly one usage query per transcribed webhook");
 });
 
 await test("a redelivered webhook does not create a second page", async () => {
   const before = store.telegram.length;
+  const usageBefore = store.usageFetches;
   const res = await firefliesFn(firefliesRequest(transcribedPayload));
   equal(res.status, 200, "status");
   equal(store.pages.size, 1, "page count");
   equal(store.telegram.length, before, "no second prompt should be sent");
+  equal(store.usageFetches, usageBefore, "a duplicate must not spend another usage request");
 });
 
 await test("ignores an event it is not subscribed to", async () => {
@@ -380,7 +499,7 @@ await test("ignores an update with a bad secret token", async () => {
   equal(store.llmCalls, before, "no model call should have been made");
 });
 
-await test("Yes writes the recap, sets the real title and marks it Done", async () => {
+await test("the legacy yes: callback still works and runs the default tier", async () => {
   await telegramFn(
     telegramRequest({
       callback_query: {
@@ -399,6 +518,12 @@ await test("Yes writes the recap, sets the real title and marks it Done", async 
   equal(store.transcriptFetches, 1, "transcript fetch count");
   equal(store.llmCalls, 1, "model call count");
 
+  // A prompt still in Telegram scrollback from before the tiers shipped sends
+  // "yes:". It must resolve to the default tier, not "Unrecognised action".
+  const req = store.extractRequests.at(-1);
+  equal(req.model, "claude-haiku-4-5-20251001", "legacy yes: must run the default tier");
+  equal(readExtractedBy(page), "claude-haiku-4-5-20251001", "Extracted By");
+
   const blocks = store.children.get(page.id);
   const texts = blocks.map((b) => (b[b.type].rich_text || []).map((r) => r.text.content).join(""));
   assert(!texts.some((t) => t.includes("Awaiting recap decision")), "the stub paragraph should have been removed");
@@ -412,7 +537,7 @@ await test("Yes writes the recap, sets the real title and marks it Done", async 
   assert(edit && !edit.body.reply_markup, "the inline keyboard should have been removed");
 });
 
-await test("tapping Yes again does nothing", async () => {
+await test("tapping the same button again does nothing", async () => {
   const before = { llm: store.llmCalls, blocks: store.children.get(pageId()).length };
   await telegramFn(
     telegramRequest({
@@ -452,7 +577,7 @@ await test("No marks the page Skipped and keeps it as a record", async () => {
   assert(store.pages.has(page.id), "the page must be kept, not deleted");
 });
 
-await test("the sweep promotes only the meetings still pending", async () => {
+await test("the sweep promotes only the meetings still pending, on the default tier", async () => {
   const third = { ...transcribedPayload, meeting_id: "THIRDMEETING", timestamp: Date.parse("2026-09-03T03:00:00Z") };
   await firefliesFn(firefliesRequest(third));
   const target = [...store.pages.values()].find((p) => readSourceId(p) === "THIRDMEETING");
@@ -467,6 +592,13 @@ await test("the sweep promotes only the meetings still pending", async () => {
   // The trigger reaches the real background function, which does the work.
   equal(store.llmCalls, llmBefore + 1, "the triggered run should have extracted");
   equal(readStatus(store.pages.get(target.id)), "Done", "status after the sweep");
+
+  // Unattended runs are the case where nobody chose, so they get the cheap
+  // model — and Haiku 4.5 rejects "adaptive", so the body must carry no
+  // thinking key at all.
+  const req = store.extractRequests.at(-1);
+  equal(req.model, "claude-haiku-4-5-20251001", "the sweep must use the default tier");
+  equal(req.thinking, undefined, "Haiku must be sent with no thinking parameter");
 });
 
 await test("/promote refuses a call with the wrong internal secret", async () => {
@@ -781,5 +913,513 @@ await test("/space warns once past the threshold and never shows negative minute
   store.minutesConsumed = 163.76;
 });
 
-console.log(failures === 0 ? "\nAll flow tests passed.\n" : `\n${failures} test(s) failed.\n`);
+
+// ---------------------------------------------------------------------------
+// Extraction tiers
+// ---------------------------------------------------------------------------
+
+const { findSweepablePages, findPendingNotes, findStaleNotesStubs } = await import("../lib/notion.js");
+
+let nextMeeting = 0;
+/** A fresh transcribed meeting with its own stub page, ready to be tapped. */
+async function freshMeeting() {
+  const id = `TIERMEETING${++nextMeeting}`;
+  await firefliesFn(
+    firefliesRequest({ ...transcribedPayload, meeting_id: id, timestamp: Date.parse("2026-09-05T03:00:00Z") })
+  );
+  const page = [...store.pages.values()].find((p) => readSourceId(p) === id);
+  return { id, page };
+}
+function tap(action, meetingId) {
+  return telegramFn(
+    telegramRequest({
+      callback_query: {
+        id: `cb-${action}-${meetingId}`,
+        from: { id: 12345 },
+        data: `${action}:${meetingId}`,
+        message: { message_id: 2000 + nextMeeting, chat: { id: 12345 } },
+      },
+    })
+  );
+}
+const blockTexts = (pageId) =>
+  (store.children.get(pageId) || []).map((b) => (b[b.type].rich_text || []).map((r) => r.text.content).join(""));
+
+console.log("\nExtraction tiers");
+
+await test("Haiku runs the cheap model with no thinking parameter", async () => {
+  const { id, page } = await freshMeeting();
+  store.extractRequests = [];
+  await tap("haiku", id);
+
+  const req = store.extractRequests.at(-1);
+  equal(req.model, "claude-haiku-4-5-20251001", "model");
+  // Haiku 4.5 rejects thinking:{type:"adaptive"} with a 400. The key must be
+  // absent entirely, not set to "off" — that would 400 just the same.
+  equal(req.thinking, undefined, "no thinking key may be sent to Haiku");
+  equal(readStatus(store.pages.get(page.id)), "Done", "status");
+  equal(readExtractedBy(store.pages.get(page.id)), "claude-haiku-4-5-20251001", "Extracted By records the model");
+});
+
+await test("Sonnet runs the better model with adaptive thinking", async () => {
+  const { id, page } = await freshMeeting();
+  store.extractRequests = [];
+  await tap("sonnet", id);
+
+  const req = store.extractRequests.at(-1);
+  equal(req.model, "claude-sonnet-5", "model");
+  equal(req.thinking?.type, "adaptive", "Sonnet must keep adaptive thinking");
+  equal(readExtractedBy(store.pages.get(page.id)), "claude-sonnet-5", "Extracted By");
+});
+
+await test("the two tiers reach the same page shape", async () => {
+  const { id, page } = await freshMeeting();
+  await tap("sonnet", id);
+  const texts = blockTexts(page.id);
+  assert(texts.includes("Summary"), "summary heading");
+  assert(texts.includes("Action items"), "action rollup");
+});
+
+await test("LLM_EXTRACT_MODEL collapses both LLM tiers onto one model", async () => {
+  process.env.LLM_EXTRACT_MODEL = "claude-opus-5";
+  try {
+    for (const tier of ["haiku", "sonnet"]) {
+      const { id } = await freshMeeting();
+      store.extractRequests = [];
+      await tap(tier, id);
+      equal(store.extractRequests.at(-1).model, "claude-opus-5", `${tier} must honour the override`);
+    }
+  } finally {
+    delete process.env.LLM_EXTRACT_MODEL;
+  }
+});
+
+await test("LLM_MODEL must not leak into a tier", async () => {
+  // config.llm.extractModel() falls back to config.llm.model, so resolving a
+  // tier through it would silently run every recap on the CHAT model whenever
+  // LLM_EXTRACT_MODEL was unset. The tier's own model has to win.
+  process.env.LLM_MODEL = "claude-some-chat-model";
+  try {
+    const { id } = await freshMeeting();
+    store.extractRequests = [];
+    await tap("haiku", id);
+    equal(store.extractRequests.at(-1).model, "claude-haiku-4-5-20251001", "the tier model must win");
+  } finally {
+    delete process.env.LLM_MODEL;
+  }
+});
+
+await test("an unrecognised callback key is reported, not silently run", async () => {
+  const { id } = await freshMeeting();
+  const before = store.llmCalls;
+  await tap("gpt9", id);
+  equal(store.llmCalls, before, "no extraction may run");
+  assert(/Unrecognised action "gpt9"/.test(lastTelegram("editMessageText").body.text), "expected the fallback reply");
+  await tap("no", id); // leave the page terminal for later sweep tests
+});
+
+// ---------------------------------------------------------------------------
+// The Notes tier
+// ---------------------------------------------------------------------------
+
+const SUMMARY = {
+  short_summary: "The team reviewed policy coverage and agreed on next steps.",
+  overview: "- **policy coverage reviewed**",
+  gist: "Policy review.",
+  action_items: "**Joao**  \nSend the policy draft (45:00)  \n\n**Nik**  \nReview the policies (12:00)  ",
+  notes: "## Policies\n\n- No policies are in place yet (12:00)\n    - Nik to check with Joao\n- Draft due Friday (45:00)",
+};
+
+console.log("\nNotes tier");
+
+await test("Notes builds the page from Fireflies' summary with no model call", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = SUMMARY;
+  store.summaryFetches = 0;
+  const llmBefore = store.llmCalls;
+  const transcriptsBefore = store.transcriptFetches;
+
+  await tap("notes", id);
+
+  const p = store.pages.get(page.id);
+  equal(readStatus(p), "Done", "status");
+  equal(readExtractedBy(p), "fireflies-notes", "Extracted By names the source, not a model");
+  equal(readState(p), null, "the claim must be cleared when the page completes");
+  equal(readTitle(p), "UAT for CC AI", "the summary query carries the real title");
+  equal(store.llmCalls, llmBefore, "the whole point of this tier: zero model calls");
+  equal(store.summaryFetches, 1, "exactly one Fireflies request");
+  equal(store.transcriptFetches, transcriptsBefore, "must not fetch the full transcript");
+});
+
+await test("a Notes page has the same skeleton as a model page", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = SUMMARY;
+  await tap("notes", id);
+
+  const texts = blockTexts(page.id);
+  assert(texts.includes("Summary"), "summary heading");
+  assert(texts.includes("Action items"), "action rollup");
+  assert(texts.includes("Policies"), "topic heading from the structured notes");
+  assert(!texts.some((t) => t.includes("Awaiting recap")), "the stub paragraph must be gone");
+  // Owner comes from the "**Joao**" header; the timestamp is kept because it
+  // is the only way back to that moment in the recording.
+  assert(texts.includes("Send the policy draft (45:00) — Joao"), `action bullet missing: ${texts.join(" | ")}`);
+  assert(texts.includes("Review the policies (12:00) — Nik"), "second owner's action missing");
+  assert(!texts.some((t) => t.includes("**")), "markdown emphasis must be stripped");
+});
+
+await test("nested Fireflies bullets survive into Notion as child blocks", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = SUMMARY;
+  await tap("notes", id);
+
+  const parent = (store.children.get(page.id) || []).find((b) =>
+    (b.bulleted_list_item?.rich_text || []).some((r) => r.text.content.includes("No policies are in place yet"))
+  );
+  assert(parent, "parent bullet missing");
+  assert(parent.has_children, "the sub-bullet was flattened away");
+  const child = store.children.get(parent.id)[0];
+  equal(child.bulleted_list_item.rich_text[0].text.content, "Nik to check with Joao", "child text");
+});
+
+await test("read_meeting can see the nested bullets", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = SUMMARY;
+  await tap("notes", id);
+
+  const { executeTool } = await import("../lib/tools.js");
+  const read = await executeTool("read_meeting", { page_id: page.id });
+  // Without listChildren({ withChildren: true }) half of a Notes recap would be
+  // invisible to the chat agent, which is the main use of the database.
+  assert(/Nik to check with Joao/.test(read.body), `sub-bullet missing from read_meeting: ${read.body}`);
+});
+
+await test("Notes with no summary yet claims the page and waits", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = null;
+  const before = store.telegram.length;
+
+  await tap("notes", id);
+
+  const p = store.pages.get(page.id);
+  equal(readStatus(p), "Processing", "status");
+  equal(readState(p), "Pending Notes", "the page must be claimed");
+  assert(blockTexts(page.id).some((t) => t.includes("Awaiting recap")), "no body should have been written");
+  const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage" && /hasn't finished/.test(t.body.text || ""));
+  assert(reply, "expected a 'still waiting' message");
+  assert(/Haiku or Sonnet/.test(reply.body.text), "the reply should offer the escape hatch");
+});
+
+await test("a second Notes tap on a claimed page spends no Fireflies quota", async () => {
+  const claimed = [...store.pages.values()].find((p) => readState(p) === "Pending Notes");
+  const before = store.summaryFetches;
+  await tap("notes", readSourceId(claimed));
+  equal(store.summaryFetches, before, "must not re-ask for a summary we know is not ready");
+  equal(readState(store.pages.get(claimed.id)), "Pending Notes", "the claim must be untouched");
+});
+
+await test("Notes on an already-recapped page spends no Fireflies quota", async () => {
+  const done = [...store.pages.values()].find((p) => readStatus(p) === "Done");
+  const before = store.summaryFetches;
+  await tap("notes", readSourceId(done));
+  equal(store.summaryFetches, before, "the guard must sit before the summary fetch");
+  assert(
+    store.telegram.some((t) => t.method === "sendMessage" && /already has a recap/.test(t.body.text || "")),
+    "expected an 'already has a recap' reply"
+  );
+});
+
+await test("a model tier takes over a claimed page and clears the claim", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = null;
+  await tap("notes", id);
+  equal(readState(store.pages.get(page.id)), "Pending Notes", "precondition: claimed");
+
+  store.summary = SUMMARY;
+  await tap("sonnet", id);
+
+  const p = store.pages.get(page.id);
+  equal(readStatus(p), "Done", "status");
+  equal(readState(p), null, "the claim must be released, or nothing can ever sweep this page");
+  equal(readExtractedBy(p), "claude-sonnet-5", "the model tier's record must win");
+});
+
+await test("the Fireflies summary field set degrades instead of failing the tier", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = SUMMARY;
+  // Pretend this account's schema has no "notes" field, the exact failure that
+  // would otherwise 400 the whole query and kill the tier on a real meeting.
+  store.rejectSummaryFields = ["notes"];
+  try {
+    await tap("notes", id);
+  } finally {
+    store.rejectSummaryFields = [];
+  }
+
+  equal(readStatus(store.pages.get(page.id)), "Done", "the page must still be built");
+  assert(!store.summaryFields.includes("notes"), "the rejected field must have been dropped");
+  const texts = blockTexts(page.id);
+  assert(texts.includes("Summary"), "summary must survive the degrade");
+  assert(texts.includes("Action items"), "action items must survive the degrade");
+});
+
+// ---------------------------------------------------------------------------
+// meeting.summarized
+// ---------------------------------------------------------------------------
+
+console.log("\nmeeting.summarized webhook");
+
+const summarizedPayload = (meetingId) => ({
+  event: "meeting.summarized",
+  timestamp: Date.now(),
+  meeting_id: meetingId,
+});
+
+await test("an unsigned meeting.summarized is refused before any lookup", async () => {
+  const notionBefore = store.notionRequests;
+  const res = await firefliesFn(
+    new Request("https://site.test/fireflies", { method: "POST", body: JSON.stringify(summarizedPayload("X")) })
+  );
+  equal(res.status, 401, "status");
+  equal(store.notionRequests, notionBefore, "the signature check must stay ahead of every query");
+});
+
+await test("meeting.summarized completes a claimed page in the background", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = null;
+  await tap("notes", id);
+  equal(readState(store.pages.get(page.id)), "Pending Notes", "precondition: claimed");
+
+  store.summary = SUMMARY;
+  store.promoteCalls = [];
+  const llmBefore = store.llmCalls;
+  const before = store.telegram.length;
+
+  const res = await firefliesFn(firefliesRequest(summarizedPayload(id)));
+  equal(res.status, 200, "Fireflies must get its acknowledgement");
+  equal(store.promoteCalls.length, 1, "completion must be handed to the background function");
+  equal(store.promoteCalls[0].mode, "notes", "it must be routed as a Notes completion");
+
+  const p = store.pages.get(page.id);
+  equal(readStatus(p), "Done", "status");
+  equal(readState(p), null, "claim cleared");
+  equal(store.llmCalls, llmBefore, "no model call anywhere on this path");
+
+  // A new message, not an edit: the prompt may be hours old by now.
+  const sent = store.telegram.slice(before).filter((t) => t.method === "sendMessage");
+  assert(sent.some((t) => /Recap saved \(Notes\)/.test(t.body.text || "")), "expected a fresh 'Recap saved' message");
+});
+
+await test("meeting.summarized with nothing claimed is a cheap no-op", async () => {
+  store.promoteCalls = [];
+  const summaryBefore = store.summaryFetches;
+  const before = store.telegram.length;
+
+  // This is the COMMON case: once subscribed, the event fires for every
+  // meeting, almost none of which is waiting on it.
+  const res = await firefliesFn(firefliesRequest(summarizedPayload("NOBODYCLAIMEDTHIS")));
+  equal(res.status, 200, "status");
+  equal(store.promoteCalls.length, 0, "no work should be triggered");
+  equal(store.summaryFetches, summaryBefore, "no Fireflies quota may be spent");
+  equal(store.telegram.length, before, "and no message sent");
+});
+
+await test("a redelivered meeting.summarized completes the page only once", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = null;
+  await tap("notes", id);
+  store.summary = SUMMARY;
+
+  await firefliesFn(firefliesRequest(summarizedPayload(id)));
+  const blocksAfterFirst = store.children.get(page.id).length;
+  store.summaryFetches = 0;
+  store.promoteCalls = [];
+
+  await firefliesFn(firefliesRequest(summarizedPayload(id)));
+  equal(store.promoteCalls.length, 0, "the claim is gone, so nothing should be triggered");
+  equal(store.summaryFetches, 0, "no second summary fetch");
+  equal(store.children.get(page.id).length, blocksAfterFirst, "the recap must not be duplicated");
+});
+
+await test("meeting.summarized with no meeting_id is acknowledged and ignored", async () => {
+  store.promoteCalls = [];
+  const res = await firefliesFn(firefliesRequest({ event: "meeting.summarized", timestamp: Date.now() }));
+  equal(res.status, 200, "status");
+  equal(store.promoteCalls.length, 0, "no work");
+});
+
+await test("/promote in notes mode never calls the model", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = null;
+  await tap("notes", id);
+  store.summary = SUMMARY;
+
+  const llmBefore = store.llmCalls;
+  const res = await promoteFn(
+    new Request("https://site.test/promote", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-internal-secret": "flow-test-internal-secret" },
+      body: JSON.stringify({ page_id: page.id, mode: "notes" }),
+    })
+  );
+  equal(res.status, 202, "background functions always answer 202");
+  equal(readStatus(store.pages.get(page.id)), "Done", "status");
+  equal(store.llmCalls, llmBefore, "zero model calls");
+});
+
+// ---------------------------------------------------------------------------
+// The sweep must not hijack a page waiting on Fireflies
+// ---------------------------------------------------------------------------
+
+console.log("\nSweep interaction with claimed pages");
+
+await test("findSweepablePages excludes a claimed page but still returns normal ones", async () => {
+  const claimedMeeting = await freshMeeting();
+  store.summary = null;
+  await tap("notes", claimedMeeting.id);
+
+  const normal = await freshMeeting(); // left Pending, Extraction State empty
+
+  const sweepable = await findSweepablePages({ includeFailed: true, limit: 50 });
+  const ids = sweepable.map((m) => m.page_id);
+
+  assert(!ids.includes(claimedMeeting.page.id), "a page waiting on Fireflies must never be swept into a PAID recap");
+  // The other half of the assertion, and the more dangerous one to get wrong:
+  // Notion's does_not_equal skips empty Selects, so a filter without the
+  // is_empty arm would match NOTHING and the sweep would silently stop working.
+  assert(ids.includes(normal.page.id), "the sweep must still find ordinary pending pages");
+});
+
+await test("the scheduled sweep leaves a claimed page alone and recaps the rest", async () => {
+  process.env.URL = "https://site.test";
+  store.promoteCalls = [];
+  store.summary = SUMMARY;
+
+  await sweepFn();
+
+  const claimed = [...store.pages.values()].filter((p) => readState(p) === "Pending Notes");
+  for (const p of claimed) {
+    assert(!store.promoteCalls.some((c) => c.page_id === p.id && c.mode !== "notes"), "a claimed page was sent for a model recap");
+  }
+  assert(store.promoteCalls.length > 0, "the sweep should still have promoted the ordinary pending page");
+});
+
+await test("the backstop fails a stub whose summary never arrived and releases the claim", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = null;
+  await tap("notes", id);
+
+  // Age the claim past the backstop window.
+  store.pages.get(page.id).last_edited_time = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  const stale = await findStaleNotesStubs({ olderThanHours: 24 });
+  equal(stale.length, 1, "the aged stub should be found");
+  equal(stale[0].page_id, page.id, "wrong stub found");
+
+  store.promoteCalls = [];
+  const before = store.telegram.length;
+  await sweepFn();
+
+  const p = store.pages.get(page.id);
+  equal(readStatus(p), "Failed", "status");
+  // Load-bearing: Failed AND still claimed would be invisible to
+  // findSweepablePages forever, so nothing could ever retry the page.
+  equal(readState(p), null, "the claim must be released so /sweep can see it again");
+  const alerts = store.telegram.slice(before).filter((t) => t.method === "sendMessage");
+  assert(alerts.some((a) => /still has no summary/.test(a.body.text || "")), "expected an alert naming the cause");
+
+  const sweepable = await findSweepablePages({ includeFailed: true, limit: 50 });
+  assert(sweepable.some((m) => m.page_id === page.id), "/sweep must be able to retry the released page");
+});
+
+await test("skipping a claimed page releases the claim", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = null;
+  await tap("notes", id);
+  equal(readState(store.pages.get(page.id)), "Pending Notes", "precondition: claimed");
+
+  await tap("no", id);
+
+  const p = store.pages.get(page.id);
+  equal(readStatus(p), "Skipped", "status");
+  // Otherwise findStaleNotesStubs returns this page on every sweep forever,
+  // spending a /promote invocation each time to rediscover it is skipped.
+  equal(readState(p), null, "Skipped is terminal and must release the claim");
+  const stale = await findStaleNotesStubs({ olderThanHours: 0 });
+  assert(!stale.some((m) => m.page_id === page.id), "a skipped page must not be a stranded stub");
+});
+
+await test("a freshly claimed stub is not touched by the backstop", async () => {
+  const { id, page } = await freshMeeting();
+  store.summary = null;
+  await tap("notes", id);
+
+  const stale = await findStaleNotesStubs({ olderThanHours: 24 });
+  assert(!stale.some((m) => m.page_id === page.id), "a stub claimed seconds ago must be left to wait");
+  equal((await findPendingNotes(id)).page_id, page.id, "findPendingNotes should still see it");
+});
+
+// ---------------------------------------------------------------------------
+// The storage meter
+// ---------------------------------------------------------------------------
+
+console.log("\nStorage meter on the transcribed prompt");
+
+await test("a failing usage query still leaves the page and the prompt intact", async () => {
+  store.usageFails = new Error("Fireflies 500");
+  const before = store.telegram.length;
+  try {
+    const res = await firefliesFn(
+      firefliesRequest({ ...transcribedPayload, meeting_id: "USAGEFAILS", timestamp: Date.parse("2026-09-06T03:00:00Z") })
+    );
+    equal(res.status, 200, "a storage reading is never worth a failed webhook delivery");
+  } finally {
+    store.usageFails = null;
+  }
+
+  assert([...store.pages.values()].some((p) => readSourceId(p) === "USAGEFAILS"), "the page must still be created");
+  const prompt = store.telegram.slice(before).find((t) => t.method === "sendMessage" && t.body.reply_markup);
+  assert(prompt, "the prompt must still be sent");
+  assert(!/Storage:/.test(prompt.body.text), "it should simply go out without the line");
+  await tap("no", "USAGEFAILS");
+});
+
+await test("a hanging usage query is aborted and does not stall the webhook", async () => {
+  store.usageHangs = true;
+  const started = Date.now();
+  try {
+    const res = await firefliesFn(
+      firefliesRequest({ ...transcribedPayload, meeting_id: "USAGEHANGS", timestamp: Date.parse("2026-09-06T04:00:00Z") })
+    );
+    equal(res.status, 200, "status");
+  } finally {
+    store.usageHangs = false;
+  }
+  // The probe's own timeout is 4s; Fireflies gives the whole webhook 10.
+  assert(Date.now() - started < 8000, `the webhook took ${Date.now() - started}ms — the abort did not fire`);
+  const prompt = lastTelegram("sendMessage");
+  assert(prompt.body.reply_markup, "the prompt must still have gone out");
+  await tap("no", "USAGEHANGS");
+});
+
+await test("the prompt warns about low storage in the same words as /space", async () => {
+  store.minutesConsumed = 380;
+  const before = store.telegram.length;
+  try {
+    await firefliesFn(
+      firefliesRequest({ ...transcribedPayload, meeting_id: "LOWSTORAGE", timestamp: Date.parse("2026-09-06T05:00:00Z") })
+    );
+  } finally {
+    store.minutesConsumed = 163.76;
+  }
+  const prompt = store.telegram.slice(before).find((t) => t.method === "sendMessage" && t.body.reply_markup);
+  assert(/Storage: 20 of 400 minutes left\./.test(prompt.body.text), `unexpected: ${prompt.body.text}`);
+  assert(/past the 320-minute mark/.test(prompt.body.text), "the warning must reach the prompt too");
+  await tap("no", "LOWSTORAGE");
+});
+
+console.log(
+  failures === 0
+    ? `\nAll flow tests passed (Status property kind: ${STATUS_TYPE}).\n`
+    : `\n${failures} test(s) failed (Status property kind: ${STATUS_TYPE}).\n`
+);
 process.exit(failures === 0 ? 0 : 1);

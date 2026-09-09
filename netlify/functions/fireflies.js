@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 import { config as app } from "../../lib/config.js";
-import { findMeetingByFirefliesId, createStubPage } from "../../lib/notion.js";
-import { sendMessage, sendYesNoPrompt } from "../../lib/telegram.js";
+import { findMeetingByFirefliesId, createStubPage, findPendingNotes } from "../../lib/notion.js";
+import { sendMessage, sendTierPrompt } from "../../lib/telegram.js";
+import { usageLine } from "../../lib/usage.js";
+import { triggerPromotions } from "../../lib/promote.js";
 import { timestampLabel, epochToLocalIso } from "../../lib/dates.js";
 
 // ---------------------------------------------------------------------------
@@ -44,45 +46,82 @@ export default async (req) => {
     return new Response("Malformed JSON", { status: 400 });
   }
 
-  // Only meeting.transcribed is subscribed, but acknowledge anything else so
-  // Fireflies does not retry an event we simply do not act on.
-  if (payload.event !== "meeting.transcribed") {
-    console.log(`Ignoring Fireflies event "${payload.event}".`);
-    return Response.json({ ok: true, ignored: payload.event });
+  // Two subscribed events. Anything else is acknowledged so Fireflies does not
+  // retry an event we simply do not act on. The meeting_id check is hoisted
+  // above the branch because both events need it.
+  const { event } = payload;
+  if (event !== "meeting.transcribed" && event !== "meeting.summarized") {
+    console.log(`Ignoring Fireflies event "${event}".`);
+    return Response.json({ ok: true, ignored: event });
   }
 
   const meetingId = payload.meeting_id;
   if (!meetingId) {
-    console.warn("meeting.transcribed arrived with no meeting_id.");
+    console.warn(`${event} arrived with no meeting_id.`);
     return Response.json({ ok: true, ignored: "no meeting_id" });
   }
 
   try {
-    // Idempotency: a redelivery must not create a second page or re-prompt.
-    const existing = await findMeetingByFirefliesId(meetingId);
-    if (existing) {
-      console.log(`Meeting ${meetingId} already has page ${existing.page_id} (${existing.status}).`);
-      return Response.json({ ok: true, duplicate: true });
-    }
-
-    // The payload carries no title and no duration — only a transcription
-    // timestamp — so the page is labelled by time until the real title
-    // arrives with the transcript on Yes.
-    const ts = Number(payload.timestamp) || Date.now();
-    const label = timestampLabel(ts);
-    const page = await createStubPage({ meetingId, label, dateIso: epochToLocalIso(ts) });
-
-    await sendYesNoPrompt(meetingId, label);
-    console.log(`Created stub page ${page.page_id} for meeting ${meetingId}.`);
-    return Response.json({ ok: true, page_id: page.page_id });
+    if (event === "meeting.summarized") return await handleSummarized(meetingId);
+    return await handleTranscribed(meetingId, payload);
   } catch (err) {
     console.error("Fireflies webhook failed:", err);
     await sendMessage(`Fireflies webhook failed for meeting ${meetingId}: ${err.message}`).catch(() => {});
-    // A non-2xx here is deliberate. If the stub page was never created there
-    // is nothing for the sweep to find later, so a redelivery is the only
-    // recovery path — and the idempotency check above makes it safe.
+    // A non-2xx here is deliberate: it asks Fireflies to redeliver. For
+    // meeting.transcribed a redelivery is the only recovery path if the stub
+    // page was never created, and for meeting.summarized it is the only way to
+    // retry a Notion lookup that failed. Both arms are idempotent — the
+    // duplicate check below and the claim guard in completeNotes — so a
+    // redelivery cannot double anything.
     return new Response("Internal error", { status: 500 });
   }
 };
+
+async function handleTranscribed(meetingId, payload) {
+  // Idempotency: a redelivery must not create a second page or re-prompt.
+  const existing = await findMeetingByFirefliesId(meetingId);
+  if (existing) {
+    console.log(`Meeting ${meetingId} already has page ${existing.page_id} (${existing.status}).`);
+    return Response.json({ ok: true, duplicate: true });
+  }
+
+  // The payload carries no title and no duration — only a transcription
+  // timestamp — so the page is labelled by time until the real title arrives
+  // with the transcript or the summary.
+  const ts = Number(payload.timestamp) || Date.now();
+  const label = timestampLabel(ts);
+  const page = await createStubPage({ meetingId, label, dateIso: epochToLocalIso(ts) });
+
+  // The storage reading rides along on the prompt: this is the one moment per
+  // meeting when it is both fresh and actionable. usageLine() never throws and
+  // times out well inside Fireflies' 10-second acknowledgement budget — the
+  // prompt goes out without the line rather than the delivery failing. The page
+  // already exists by this point, so even a slow probe cannot cost you it.
+  await sendTierPrompt(meetingId, label, await usageLine());
+  console.log(`Created stub page ${page.page_id} for meeting ${meetingId}.`);
+  return Response.json({ ok: true, page_id: page.page_id });
+}
+
+/**
+ * Fireflies has finished summarising. Only interesting if a Notes tap claimed a
+ * page and is waiting on exactly this — which is the minority case: once the
+ * event is subscribed it fires for EVERY meeting, so the no-op below is the
+ * common path and is kept to a single Notion query.
+ *
+ * Completion is not done inline. This function is synchronous against a
+ * 10-second budget; it hands the work to /promote, the same background
+ * function the sweep fans out to, and returns immediately.
+ */
+async function handleSummarized(meetingId) {
+  const claimed = await findPendingNotes(meetingId);
+  if (!claimed) {
+    console.log(`meeting.summarized for ${meetingId}: no page is waiting on it.`);
+    return Response.json({ ok: true, ignored: "nothing claimed" });
+  }
+
+  const { triggered } = await triggerPromotions([claimed], { mode: "notes" });
+  console.log(`meeting.summarized for ${meetingId}: triggered completion of ${claimed.page_id}.`);
+  return Response.json({ ok: true, page_id: claimed.page_id, triggered: triggered.length });
+}
 
 export const config = { path: "/fireflies" };

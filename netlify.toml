@@ -13,4 +13,4 @@
 #   netlify/functions/telegram.js            path /telegram   background
 #   netlify/functions/fireflies.js           path /fireflies  synchronous
 #   netlify/functions/promote-background.js  path /promote    background
-#   netlify/functions/sweep.js               schedule 0 10 * * 5  (Fri 17:00 Bangkok)
+#   netlify/functions/sweep.js               schedule 0 15 * * 2,5 (Tue+Fri 22:00 Bangkok)

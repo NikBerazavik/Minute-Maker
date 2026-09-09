@@ -9,9 +9,9 @@
   },
   "scripts": {
     "verify": "node --env-file=.env scripts/verify.js",
-    "test": "node scripts/test-render.js && node scripts/test-flow.js",
+    "test": "node scripts/test-render.js && npm run test:flow --silent",
     "test:render": "node scripts/test-render.js",
-    "test:flow": "node scripts/test-flow.js",
+    "test:flow": "node scripts/test-flow.js && FLOW_STATUS_TYPE=status node scripts/test-flow.js",
     "test:llm": "node --env-file=.env scripts/test-llm.js",
     "webhook:set": "node --env-file=.env scripts/setup-webhook.js",
     "webhook:info": "node --env-file=.env scripts/setup-webhook.js info",
