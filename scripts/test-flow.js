@@ -52,6 +52,9 @@ const store = {
   llmCalls: 0,
   chatRequests: [], // request bodies the chat loop sent
   chatScript: [], // canned responses for the chat loop, consumed in order
+  notionRequests: 0, // every outbound Notion call, for the cost assertions
+  usageFetches: 0, // how many times /space hit the Fireflies user query
+  minutesConsumed: 163.76, // the storage meter /space reports on
   promoteCalls: [], // bodies POSTed to the /promote background function
   transcriptFetches: 0,
   transcriptExists: true,
@@ -114,6 +117,7 @@ globalThis.fetch = async (url, options = {}) => {
 
   // ----- Notion ------------------------------------------------------------
   if (u.startsWith("https://api.notion.com/v1")) {
+    store.notionRequests++;
     const path = u.slice("https://api.notion.com/v1".length).split("?")[0];
 
     if (method === "GET" && path === "/databases/db-1") return json({ data_sources: [{ id: "ds-1", name: "Meetings" }] });
@@ -200,6 +204,10 @@ globalThis.fetch = async (url, options = {}) => {
     if (body.query.includes("addToLiveMeeting")) {
       store.lastJoin = body.variables;
       return json({ data: { addToLiveMeeting: { success: true, message: "joining" } } });
+    }
+    if (body.query.includes("minutes_consumed")) {
+      store.usageFetches++;
+      return json({ data: { user: { minutes_consumed: store.minutesConsumed, num_transcripts: 7 } } });
     }
     if (body.query.includes("transcript(")) {
       store.transcriptFetches++;
@@ -743,6 +751,34 @@ await test("the loop stops instead of spinning when the model keeps calling tool
   equal(store.chatRequests.length, 6, "MAX_TURNS should cap the loop at 6");
   const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage");
   assert(/got stuck/.test(reply.body.text), `unexpected reply: ${reply.body.text}`);
+});
+
+await test("/space reports the storage meter without touching Notion or the model", async () => {
+  store.usageFetches = 0;
+  store.chatRequests = [];
+  const notionBefore = store.notionRequests;
+  const before = store.telegram.length;
+
+  await telegramFn(telegramRequest({ message: { chat: { id: 12345 }, text: "/space" } }));
+
+  const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage");
+  assert(/164 of 400 minutes used \(40%\)/.test(reply.body.text), `unexpected reply: ${reply.body.text}`);
+  assert(/236 minutes left, across 7 transcript/.test(reply.body.text), `unexpected reply: ${reply.body.text}`);
+
+  // The whole point of this command: it is the cheapest thing the bot does.
+  equal(store.usageFetches, 1, "/space must make exactly one Fireflies request");
+  equal(store.chatRequests.length, 0, "/space must never call the model");
+  equal(store.notionRequests, notionBefore, "/space must never call Notion");
+});
+
+await test("/space warns once past the threshold and never shows negative minutes", async () => {
+  store.minutesConsumed = 412;
+  const before = store.telegram.length;
+  await telegramFn(telegramRequest({ message: { chat: { id: 12345 }, text: "/space" } }));
+  const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage");
+  assert(/past the 320-minute mark/.test(reply.body.text), `expected a warning: ${reply.body.text}`);
+  assert(/0 minutes left/.test(reply.body.text), `must clamp at zero: ${reply.body.text}`);
+  store.minutesConsumed = 163.76;
 });
 
 console.log(failures === 0 ? "\nAll flow tests passed.\n" : `\n${failures} test(s) failed.\n`);

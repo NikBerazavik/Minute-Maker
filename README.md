@@ -32,6 +32,7 @@ You tap No  ──▶ page body becomes "Skipped", Status: Skipped, page KEPT
 
 Friday 17:00 ──▶ sweep ──▶ /promote (one background run per meeting)
 /sweep       ──▶ same promotion logic, on demand, and retries failures
+/space       ──▶ Fireflies storage meter (one API call, no LLM, no Notion)
 
 Anything else you type ──▶ tool-use loop over your meeting notes
 ```
@@ -262,6 +263,7 @@ you've already deleted from Fireflies, so treat the first few as test data.
 | Thing | Limit |
 |---|---|
 | Fireflies API, free plan | 50 requests/day total |
+| Fireflies storage, free plan | 400 stored minutes — check with `/space` |
 | `addToLiveMeeting` | 3 requests / 20 minutes |
 | Fireflies webhook response | must be 2xx within 10 s |
 | Notion | ~3 requests/s, 100 blocks per append, 2000 chars per text object |

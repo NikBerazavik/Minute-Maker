@@ -2,7 +2,7 @@ import { config as app } from "../../lib/config.js";
 import { sendMessage, answerCallbackQuery, editMessageText } from "../../lib/telegram.js";
 import { findMeetingByFirefliesId, findSweepablePages } from "../../lib/notion.js";
 import { promoteMeeting, skipMeeting, triggerPromotions } from "../../lib/promote.js";
-import { addToLiveMeeting, FirefliesError } from "../../lib/fireflies.js";
+import { addToLiveMeeting, getUsage, FirefliesError } from "../../lib/fireflies.js";
 import { parseJoinCommand } from "../../lib/join.js";
 import { runAgent } from "../../lib/agent.js";
 
@@ -31,6 +31,7 @@ const HELP = [
   "  after them is the language (thai, english, or a code like th, ja, zh-CN).",
   "  Both are optional — without a language I let Fireflies auto-detect it.",
   "/sweep — process any meeting still waiting on a Yes/No answer",
+  "/space — how much Fireflies transcription storage is left",
   "/help — this message",
   "",
   "When a transcript is ready I'll ask whether you want a recap. Tap Yes or No.",
@@ -68,6 +69,42 @@ async function handleJoin(argText) {
     }
     return sendMessage(`Could not ask Fireflies to join: ${err.message}`);
   }
+}
+
+/**
+ * Fireflies' free plan caps stored transcription at a number of minutes, and
+ * nothing warns you before a meeting is refused. One API call, no LLM, no
+ * Notion — deliberately the cheapest command in the bot.
+ */
+async function handleSpace() {
+  let usage;
+  try {
+    usage = await getUsage();
+  } catch (err) {
+    if (err instanceof FirefliesError && err.isRateLimited) {
+      return sendMessage("Fireflies is rate limiting me right now — try /space again in a few minutes.");
+    }
+    return sendMessage(`Could not read your Fireflies usage: ${err.message}`);
+  }
+
+  const cap = app.fireflies.minutesAllowance;
+  const used = usage.minutesConsumed;
+  const left = Math.max(0, cap - used);
+  // Floor, not round: 398 of 400 must not read "100%" next to "2 minutes left".
+  const percent = cap > 0 ? Math.floor((used / cap) * 100) : 0;
+
+  const lines = [
+    `Fireflies storage: ${Math.round(used)} of ${cap} minutes used (${percent}%).`,
+    `${Math.round(left)} minutes left, across ${usage.transcripts} transcript(s).`,
+  ];
+  if (used >= app.fireflies.minutesWarnAt) {
+    lines.push(
+      "",
+      `That is past the ${app.fireflies.minutesWarnAt}-minute mark — clear some transcripts in Fireflies soon.`,
+      "Anything already recapped into Notion is safe to delete there."
+    );
+  }
+  return sendMessage(lines.join("\n"));
 }
 
 async function handleSweep() {
@@ -131,6 +168,7 @@ async function handleMessage(text) {
   const [command, ...rest] = text.split(/\s+/);
   if (command === "/join") return handleJoin(rest.join(" "));
   if (command === "/sweep") return handleSweep();
+  if (command === "/space") return handleSpace();
 
   const { text: reply, usage } = await runAgent(text);
   console.log(`Handled message. Tokens in=${usage.input} out=${usage.output}`);
