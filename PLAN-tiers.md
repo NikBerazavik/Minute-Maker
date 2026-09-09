@@ -1,16 +1,18 @@
 # Extraction Tiers — Implementation Plan (draft for review)
 
-**Supersedes `PLAN.md`.** Same underlying feature, but re-scoped around the final
-decision: a **four-button keyboard** — `Haiku`, `Sonnet`, `Notes`, `Skip` — with
-**Haiku as the default tier**. "Notes" is what `PLAN.md` called "Instant": a
+**Supersedes an earlier draft, `PLAN.md`**, which was deleted once this document
+replaced it — recover it with `git show 0271589:PLAN.md` if you ever want the
+reasoning behind a decision restated below. Same underlying feature, re-scoped
+around the final decision: a **four-button keyboard** — `Haiku`, `Sonnet`, `Notes`, `Skip` — with
+**Haiku as the default tier**. "Notes" was called "Instant" in the earlier draft: a
 zero-LLM recap built from Fireflies' own meeting summary.
 
-Everything here is **plan only, not yet built**, except the pieces `PLAN.md` §8–§11
-already shipped (`/space`, the event-selectable `scripts/sign.js`, the
+Everything in Part I was **plan only, not yet built** when written, except the
+pieces that had already shipped (`/space`, the event-selectable `scripts/sign.js`, the
 `notionRequests` / `usageFetches` test counters). Those stay as they are.
 
-This document is written to be reviewed cold, without `PLAN.md` open. Where a
-decision was already settled there, it is restated here with a back-reference.
+This document is written to be read cold. Every decision that was settled in the
+earlier draft is restated here in full, so nothing depends on that file.
 
 ---
 
@@ -30,7 +32,7 @@ as today. When the transcript is ready, the Telegram prompt offers four choices:
 scheduled sweep use (no interactive prompt there), and it is what a legacy `yes:`
 callback maps to.
 
-Non-goals, unchanged from `PLAN.md` §5:
+Non-goals, unchanged from the earlier draft:
 
 - No change to the LLM extraction prompt, schema, or `normalizeExtraction`
   (`lib/extract.js`). Tiers route a model id + thinking mode; they do not touch
@@ -40,7 +42,7 @@ Non-goals, unchanged from `PLAN.md` §5:
 
 ---
 
-## 2. Current state of the repo (for the reviewer)
+## 2. Current state of the repo, before any of this was built
 
 | Concern | Today |
 |---|---|
@@ -56,16 +58,16 @@ Non-goals, unchanged from `PLAN.md` §5:
 | Fireflies webhook | `/fireflies`, synchronous, only acts on `meeting.transcribed`; unknown events get a harmless 200 — [netlify/functions/fireflies.js:49](netlify/functions/fireflies.js:49) |
 | Notion schema | `Name`, `Date`, `Source Meeting ID`, `Status`, **plus** `Extraction State` and `Extracted By` added by hand (see §3) |
 
-Four premises from `PLAN.md` §0 still hold and drive the design below:
+Four premises still hold and drive the design below:
 
-- **§0.2 — the sweep will hijack Notes stubs.** `findSweepablePages` knows nothing
+- **P1 — the sweep will hijack Notes stubs.** `findSweepablePages` knows nothing
   about `Extraction State`, so a page waiting on a Fireflies summary gets grabbed
   by `/sweep` or the Friday job and silently given a *paid LLM* recap. The sweep
   filter **must** exclude `Extraction State = Pending Notes`. Required, not optional.
-- **§0.3 — the stub page already exists.** `meeting.transcribed` created it. Tapping
+- **P2 — the stub page already exists.** `meeting.transcribed` created it. Tapping
   a button patches that page; it never creates one. No duplicate-page risk on this
   path; the real risk is re-running work on one page (state guard, §7).
-- **§0.4 — a Haiku tier 400s on the first call as currently wired.** `adaptive`
+- **P3 — a Haiku tier 400s on the first call as currently wired.** `adaptive`
   thinking is a Claude-5-family parameter; Haiku 4.5 rejects it with a 400
   ([lib/config.js:29](lib/config.js:29) already says so). The moment Haiku is
   selectable per-meeting, one global `LLM_THINKING` cannot serve both tiers.
@@ -75,23 +77,24 @@ Four premises from `PLAN.md` §0 still hold and drive the design below:
 
 ## 3. Notion properties — already added, confirm only
 
-Per `PLAN.md` §7.1 the reviewer added both by hand:
+Both were added by hand in Notion:
 
 | Property | Type | Notes |
 |---|---|---|
 | `Extraction State` | **Select** | One option: `Pending Notes`. Empty = normal. **Not** Notion's Status type — no lifecycle grouping, and Select auto-creates the option on first write so a typo fails soft. |
 | `Extracted By` | **Text** (rich_text) | Free-form model id. Never a Select — model ids change every release and dead options would accumulate. |
 
-> `PLAN.md` used the label **`Pending Instant`**. If the reviewer already created
-> the Select option with that spelling, either rename it to `Pending Notes` in the
-> Notion UI **or** keep `Pending Instant` as the literal in `config.js`. The code
-> matches this string **literally** — pick one and make `verify.js` assert it.
+> The earlier draft used the label **`Pending Instant`**, and that is the option
+> that exists in Notion today. The code matches this string **literally**, so
+> either rename the option to `Pending Notes` in the Notion UI **or** set
+> `NOTES_STATE_LABEL=Pending Instant`. `verify.js` reports which literal is in
+> use and flags the stray on every run. See Part II §G.
 
-Decision carried from `PLAN.md` §6.6: **no further `Extraction State` options.** A
+**No further `Extraction State` options.** A
 `Done` option would duplicate `Status = Done` and the two would drift. Empty is a
 fine "nothing pending" and needs no migration.
 
-Decision carried from `PLAN.md` §6.5: **no backfill.** Existing pages keep
+**No backfill.** Existing pages keep
 `Extracted By` empty.
 
 ---
@@ -212,8 +215,8 @@ No."
 - `const thinking = t.thinking;`
 - pass `{ model, thinking }` into `extractMeeting`.
 - on success, `patchMeeting` also writes `Extracted By = (t.extractedBy ?? model)`
-  **and clears `Extraction State`** (this is `PLAN.md` decision 6's tier-switch
-  cleanup — it falls out for free: any tier finishing a page clears the claim).
+  **and clears `Extraction State`** — the tier-switch cleanup falls out for free,
+  because any tier finishing a page clears the claim.
 - success message names the tier: `"Recap saved (Haiku): <title>\n<url>"`.
 
 `/sweep` and the scheduled sweep call `promoteMeeting` with no `tier` → default
@@ -246,19 +249,20 @@ is intended — cheaper unattended recaps. Call it out in the README.
 
 ### 5.6 The Notes tier (was "Instant")
 
-This is `PLAN.md` §3 Phase 1, verbatim in intent, with `Instant`→`Notes`. The
-Fireflies summary shapes were **verified against the live account on 2026-09-09**
-(`PLAN.md` §3 Phase 1) — `summary.overview` and `summary.action_items` are both
-**strings**, not arrays. Formats and the parser rules are in `PLAN.md`; carry them
-across unchanged.
+> **Superseded by Part II §B.** The paragraph below records what was believed
+> when Part I was written: that `summary.overview` and `summary.action_items` are
+> both **strings**, not arrays. `action_items` held up exactly. `overview` did
+> not — it is a bold-bullet list on this account, not prose — and a much better
+> structured-recap field exists. Read §B before this section.
+
+The Notes tier renders Fireflies' own summary with no model call.
 
 **`lib/fireflies.js` — new `getSummary(id)`**
 - One GraphQL query: `transcript(id) { id title date summary { overview action_items } }`.
 - Does **not** request `sentences` — fetching the full transcript would defeat the
   cheap tier.
 - `title` + `date` come back in the same query for free, so a completed Notes page
-  gets its real title instead of the `"Meeting — Sep 1, 14:15"` stub label
-  (`PLAN.md` decision 6.4).
+  gets its real title instead of the `"Meeting — Sep 1, 14:15"` stub label.
 
 **`lib/render.js` — `renderNotesBlocks({ overview, actionItems })`**
 - Belongs in `render.js` (its charter is deterministic content → Notion blocks, no
@@ -269,12 +273,12 @@ across unchanged.
   `**…**`-only line as an owner header, attach following lines to that owner, strip
   `- ` / `**` from overview lines. **Must degrade, never throw** — a Fireflies
   summary is not schema-validated the way the LLM extraction is.
-- Language note (`PLAN.md` §3): Fireflies summaries come back in the meeting's
+- Language note: Fireflies summaries come back in the meeting's
   language (Thai for the verified meeting), whereas LLM pages are forced to
   English. Accepted — translating would need an LLM call. The DB becomes
   mixed-language; `search_meetings` matches on title only so search still works.
 
-**`lib/notes.js` — new, the orchestration** (`PLAN.md` called it `lib/instant.js`)
+**`lib/notes.js` — new, the orchestration** (the earlier draft called it `lib/instant.js`)
 - `claimNotes(pageId)` — sets `Extraction State = Pending Notes`, `Status = Processing`.
 - `completeNotes(pageId, meetingId)` — the **single shared completion path** for
   all three entry points (tap-with-summary-present, `meeting.summarized`, 24h
@@ -297,10 +301,10 @@ across unchanged.
 - `findStaleNotesStubs({ olderThanHours })` — `Extraction State = Pending Notes`
   and `last_edited_time` before cutoff. Same `timestamp: "last_edited_time"` shape
   already used at [lib/notion.js:180](lib/notion.js:180).
-- **`findSweepablePages` — exclude Notes stubs.** This is the §0.2 fix. Notion's
+- **`findSweepablePages` — exclude Notes stubs.** This is the P1 fix. Notion's
   `does_not_equal` on a Select does **not** match empty rows, and almost every
   page has an empty `Extraction State`, so it must be an explicit `or` on every
-  arm (`PLAN.md` §6.6):
+  arm:
 
   ```
   or: [ { property: "Extraction State", select: { does_not_equal: "Pending Notes" } },
@@ -310,7 +314,7 @@ across unchanged.
   Getting this wrong fails silent in the worst direction — the sweep matches
   nothing and quietly stops recapping everything. Needs a dedicated test.
 
-**`netlify/functions/fireflies.js` — event branching** (`PLAN.md` §3)
+**`netlify/functions/fireflies.js` — event branching**
 - Order stays: method check → raw body → **signature verify (must stay first)** →
   JSON parse → **event branch** → hoist the `meeting_id` presence check above the
   branch (both events need it).
@@ -329,11 +333,10 @@ across unchanged.
 
 **`netlify/functions/sweep.js` — 24h backstop**
 - After the existing promotion pass, `findStaleNotesStubs({ olderThanHours: 24 })`.
-- Backstop behaviour = `PLAN.md` decision 6.1 option (a): re-query Fireflies,
-  complete as Notes if the summary is now there; if still empty, `Status = Failed`
-  + Telegram alert. Stays zero-LLM.
+- Backstop behaviour: re-query Fireflies, complete as Notes if the summary is now
+  there; if still empty, `Status = Failed` + Telegram alert. Stays zero-LLM.
 - Scheduled functions get 30 seconds — this pass only **triggers**, never performs.
-- Cadence = `PLAN.md` decision 6.2: `0 10 * * 5` → **`0 15 * * 2,5`** (Tue + Fri
+- Cadence: `0 10 * * 5` → **`0 15 * * 2,5`** (Tue + Fri
   22:00 Bangkok). Worst-case wait for a stranded stub drops from ~7 days to ~3½.
   Update the file's top comment and the routing note in `netlify.toml`.
 
@@ -363,14 +366,13 @@ What protects it:
   commented) next to the existing `LLM_PROVIDER` / `LLM_MODEL` / `LLM_EXTRACT_MODEL`
   / `LLM_THINKING` entries.
 
-Open question for the reviewer: do you also want a **per-tier provider** (e.g.
-Haiku via Anthropic, Sonnet via OpenRouter simultaneously)? That is a bigger
-change — `chat()` would take a provider argument instead of reading the global —
-and is **not** in this plan. Flagging only.
+A **per-tier provider** (Haiku via Anthropic, Sonnet via OpenRouter at the same
+time) would be a bigger change — `chat()` would take a provider argument instead
+of reading the global — and was ruled out of scope; see Part II §A decision 5.
 
 ---
 
-## 7. Double-tap / already-done guard (`PLAN.md` §3.4)
+## 7. Double-tap / already-done guard
 
 The keyboard-removal on tap is a UI defence only — it does not survive Telegram
 redelivery, a stale message in scrollback, or a second device. The guard must be
@@ -390,7 +392,7 @@ checker, so the LLM and Notes paths cannot drift on what "already done" means.
 eligible for a *new* claim but *is* eligible for `completeNotes` — so it takes an
 intent argument, or Notes gets a thin wrapper.
 
-Claim-before-query for the Notes tap (`PLAN.md` §1.1): write `Extraction State =
+Claim-before-query for the Notes tap: write `Extraction State =
 Pending Notes` **before** calling `getSummary`. If the query then returns a
 summary, complete immediately and clear the claim in the same finishing write.
 Costs one extra Notion write on the happy path and closes the race where
@@ -402,18 +404,21 @@ Costs one extra Notion write on the happy path and closes the race where
 
 | Where | Change | When |
 |---|---|---|
-| **Notion** | `Extraction State` (Select, one option) + `Extracted By` (Text) — **done**. Confirm `Extracted By` is Text not Select; confirm the Select option spelling matches the `config.js` literal (§3). | before deploy |
+| **Notion** | `Extraction State` (Select, one option) + `Extracted By` (Text) — **done**. `npm run verify` confirms both types and reports the option spelling in use. | before deploy |
 | **Fireflies dashboard** | Add `meeting.summarized` to the **existing** Webhooks V2 subscription — same URL, same signing secret. Do **not** create a second endpoint. | **after** the branching handler is live (§9) |
+| **Notion** | `Extraction State` needs **one** option and only one. There is deliberately no `Done` option: it would duplicate `Status = Done` and the two would drift. Empty means "nothing pending". | before deploy |
 | **Netlify env** | Optional: `LLM_MODEL_HAIKU`, `LLM_MODEL_SONNET` for OpenRouter trials. Nothing required. | any time |
 | **Telegram** | Nothing — `allowed_updates` already includes `callback_query` ([scripts/setup-webhook.js:45](scripts/setup-webhook.js:45)). | — |
 
-Note (`PLAN.md` §3): today's deployed handler already 200s unknown events, so
+Note: today's deployed handler already 200s unknown events, so
 subscribing `meeting.summarized` early is a harmless no-op, not a failure. Deploy
 before subscribe is still the right order — a preference, not a cliff.
 
-Confirm during the walkthrough: that the Fireflies plan actually offers
-`meeting.summarized` as subscribable, and whether it fires for meetings summarised
-*before* the subscription was added. Neither is documented.
+Still unconfirmed, and only answerable against the live dashboard: whether the
+Fireflies plan offers `meeting.summarized` as subscribable at all, and whether it
+fires for meetings summarised *before* the subscription was added. Neither is
+documented. The 24-hour backstop covers both cases either way, which is why
+neither blocks the deploy.
 
 ---
 
@@ -427,8 +432,8 @@ Confirm during the walkthrough: that the Fireflies plan actually offers
 4. **Only then** subscribe `meeting.summarized` in the Fireflies dashboard.
 5. Test Notes on a fresh meeting, tapping early enough to miss the summary, and
    confirm the follow-up message lands when `meeting.summarized` arrives. The
-   `scripts/sign.js -- <id> meeting.summarized` helper (already built, `PLAN.md`
-   §9) exercises this without the dashboard.
+   `scripts/sign.js -- <id> meeting.summarized` helper (already built) exercises
+   this without the dashboard.
 
 ---
 
@@ -445,7 +450,7 @@ LLM tiers:
 - `LLM_EXTRACT_MODEL` set → both `haiku:` and `sonnet:` resolve to that model.
 - Existing `no:` / skip case unchanged.
 
-Notes tier (mirrors `PLAN.md` §3 test list):
+Notes tier:
 
 - Tap `notes:` with summary present → page `Done` in one pass, `chatRequests.length
   === 0`, exactly 1 Fireflies summary fetch.
@@ -458,7 +463,7 @@ Notes tier (mirrors `PLAN.md` §3 test list):
   query, §7).
 - Tier switch (`notes:` then `sonnet:`) → claim cleared, no orphan `Extraction
   State`.
-- **`findSweepablePages` does not return a `Pending Notes` page** — the §0.2
+- **`findSweepablePages` does not return a `Pending Notes` page** — the P1
   regression guard, the single most valuable new test. Also assert it still
   returns a normal empty-`Extraction State` page (the `is_empty` arm).
 
@@ -477,7 +482,7 @@ sweeps now use Haiku.
 1. **Select option label** — `Pending Notes` vs keeping `Pending Instant` as
    already created in Notion (§3). Pick the literal; `verify.js` will enforce it.
 2. **`Extracted By` literal for the Notes tier** — `fireflies-notes` (proposed) vs
-   `PLAN.md`'s `fireflies-deterministic` vs something else.
+   the earlier draft's `fireflies-deterministic` vs something else.
 3. **Keyboard layout** — 2×2 `Haiku/Sonnet` over `Notes/Skip` (proposed) vs a
    single row of four vs `Notes` first. Telegram renders a single row of four
    narrow buttons acceptably on desktop, less so on mobile.
@@ -752,7 +757,7 @@ Everything below is an automated assertion in `npm test`, except the four marked
 
 **Sweep**
 
-26. `findSweepablePages` does **not** return a `Pending Notes` page — the §0.2 regression guard.
+26. `findSweepablePages` does **not** return a `Pending Notes` page — the P1 regression guard.
 27. It still returns a page whose `Extraction State` is empty (the `is_empty` arm — the failure this test exists to catch is the sweep silently matching *nothing*).
 28. A stub claimed more than 24 hours ago is picked up by the backstop; a fresh one is not.
 29. The backstop marks a still-summary-less stub `Failed`, **clears the claim**, and alerts — after which `/sweep` can see it again.
