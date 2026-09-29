@@ -66,6 +66,9 @@ const store = {
   usageFails: null, // set to an Error to make the usage query fail
   usageHangs: false, // never resolves, to prove the timeout works
   extractRequests: [], // Anthropic request bodies for extract_meeting
+  titleFetches: 0, // title-only queries for the chat hand-off prompt
+  titleFails: null, // set to an Error to make the title query fail
+  meetingTitle: "UAT for CC AI", // what the title query returns
 };
 
 // "Status" is legitimately either a Select or Notion's dedicated Status type
@@ -292,6 +295,11 @@ globalThis.fetch = async (url, options = {}) => {
       if (store.usageFails) throw store.usageFails;
       return json({ data: { user: { minutes_consumed: store.minutesConsumed, num_transcripts: 7 } } });
     }
+    if (body.query.includes("query Title(")) {
+      store.titleFetches++;
+      if (store.titleFails) throw store.titleFails;
+      return json({ data: { transcript: { title: store.meetingTitle } } });
+    }
     if (body.query.includes("summary {")) {
       store.summaryFetches++;
       const asked = body.query.match(/summary \{([^}]*)\}/)[1].trim().split(/\s+/);
@@ -439,7 +447,7 @@ await test("rejects an unsigned request with 401", async () => {
   equal(store.pages.size, 0, "no page should have been created");
 });
 
-await test("creates a stub page and sends the four-button tier prompt", async () => {
+await test("creates a stub page and sends the chat + tier prompt", async () => {
   const res = await firefliesFn(firefliesRequest(transcribedPayload));
   equal(res.status, 200, "status");
   equal(store.pages.size, 1, "page count");
@@ -454,12 +462,33 @@ await test("creates a stub page and sends the four-button tier prompt", async ()
   const prompt = lastTelegram("sendMessage");
   assert(prompt.body.reply_markup, "prompt has no inline keyboard");
   const rows = prompt.body.reply_markup.inline_keyboard;
-  equal(rows.length, 2, "expected a 2x2 grid");
-  const keys = rows.flat().map((b) => b.callback_data.split(":")[0]);
-  equal(keys.join(","), "haiku,sonnet,notes,no", "button order");
-  for (const b of rows.flat()) {
+  equal(rows.length, 3, "chat row, callback row, copy row");
+
+  // Row 1: URL buttons straight into the apps, prompt prefilled.
+  equal(rows[0].map((b) => b.text).join(","), "Claude,ChatGPT", "chat row");
+  const want = `Recap my Fireflies meeting "UAT for CC AI" (Fireflies transcript ID: ${MEETING_ID}) into my Notion Meetings database.`;
+  equal(rows[0][0].url, `https://claude.ai/new?q=${encodeURIComponent(want)}`, "Claude URL");
+  equal(rows[0][1].url, `https://chatgpt.com/?q=${encodeURIComponent(want)}`, "ChatGPT URL");
+  for (const b of rows[0]) {
+    // Telegram only accepts http(s) and tg:// on a URL button — a claude:// or
+    // chatgpt:// scheme would reject the whole message.
+    assert(/^https:\/\//.test(b.url), `URL button must be https: ${b.url}`);
+    assert(!b.callback_data, "a URL button cannot also carry callback_data");
+  }
+
+  // Row 2: only the OFFERED tiers — Sonnet and Notes are retired from the keyboard.
+  const keys = rows[1].map((b) => b.callback_data.split(":")[0]);
+  equal(keys.join(","), "haiku,no", "callback row");
+  for (const b of rows[1]) {
     assert(Buffer.byteLength(b.callback_data) <= 64, `callback_data "${b.callback_data}" exceeds Telegram's 64 bytes`);
   }
+
+  // Row 3: the same prompt, copyable, for when an app opens without it.
+  equal(rows[2][0].copy_text?.text, want, "copy button carries the same prompt");
+  assert(want.length <= 256, "copy_text is capped at 256 characters");
+
+  assert(/^Transcript ready: UAT for CC AI\n/.test(prompt.body.text), `title missing: ${prompt.body.text}`);
+  equal(store.titleFetches, 1, "exactly one title query per transcribed webhook");
 
   // The storage meter rides along on the prompt — this is the "how many of my
   // 400 minutes are left" report, delivered once per transcribed meeting.
@@ -1107,7 +1136,7 @@ await test("Notes with no summary yet claims the page and waits", async () => {
   assert(blockTexts(page.id).some((t) => t.includes("Awaiting recap")), "no body should have been written");
   const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage" && /hasn't finished/.test(t.body.text || ""));
   assert(reply, "expected a 'still waiting' message");
-  assert(/Haiku or Sonnet/.test(reply.body.text), "the reply should offer the escape hatch");
+  assert(/Claude or ChatGPT/.test(reply.body.text), "the reply should offer the escape hatch");
 });
 
 await test("a second Notes tap on a claimed page spends no Fireflies quota", async () => {
@@ -1415,6 +1444,57 @@ await test("the prompt warns about low storage in the same words as /space", asy
   assert(/Storage: 20 of 400 minutes left\./.test(prompt.body.text), `unexpected: ${prompt.body.text}`);
   assert(/past the 320-minute mark/.test(prompt.body.text), "the warning must reach the prompt too");
   await tap("no", "LOWSTORAGE");
+});
+
+// ---------------------------------------------------------------------------
+// Chat hand-off prompt
+// ---------------------------------------------------------------------------
+
+console.log("\nChat hand-off prompt");
+
+await test("a failing title query falls back to the timestamp label", async () => {
+  store.titleFails = new Error("Fireflies 500");
+  const before = store.telegram.length;
+  try {
+    const res = await firefliesFn(
+      firefliesRequest({ ...transcribedPayload, meeting_id: "TITLEFAILS", timestamp: Date.parse("2026-09-06T06:00:00Z") })
+    );
+    equal(res.status, 200, "a title is never worth a failed webhook delivery");
+  } finally {
+    store.titleFails = null;
+  }
+  const prompt = store.telegram.slice(before).find((t) => t.method === "sendMessage" && t.body.reply_markup);
+  assert(prompt, "the prompt must still be sent");
+  const copy = prompt.body.reply_markup.inline_keyboard.flat().find((b) => b.copy_text).copy_text.text;
+  assert(copy.includes('"Meeting — Sep 6, 13:00"'), `expected the timestamp label: ${copy}`);
+  assert(copy.includes("TITLEFAILS"), "the Fireflies id must still be in the prompt");
+  await tap("no", "TITLEFAILS");
+});
+
+await test("a very long title is trimmed so the copy button survives", async () => {
+  store.meetingTitle = "Quarterly planning ".repeat(20).trim();
+  const before = store.telegram.length;
+  try {
+    await firefliesFn(
+      firefliesRequest({ ...transcribedPayload, meeting_id: "LONGTITLE", timestamp: Date.parse("2026-09-06T07:00:00Z") })
+    );
+  } finally {
+    store.meetingTitle = "UAT for CC AI";
+  }
+  const prompt = store.telegram.slice(before).find((t) => t.method === "sendMessage" && t.body.reply_markup);
+  const copy = prompt.body.reply_markup.inline_keyboard.flat().find((b) => b.copy_text);
+  assert(copy, "the copy button must not be dropped for a long title");
+  assert(copy.copy_text.text.length <= 256, `copy_text is ${copy.copy_text.text.length} chars`);
+  assert(copy.copy_text.text.includes("LONGTITLE"), "trimming must never cut the Fireflies id");
+  await tap("no", "LONGTITLE");
+});
+
+await test("a retired Sonnet button in scrollback still runs Sonnet", async () => {
+  const { id, page } = await freshMeeting();
+  store.extractRequests = [];
+  await tap("sonnet", id);
+  equal(store.extractRequests.at(-1).model, "claude-sonnet-5", "model");
+  equal(readStatus(store.pages.get(page.id)), "Done", "status");
 });
 
 console.log(

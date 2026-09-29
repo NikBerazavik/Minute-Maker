@@ -37,12 +37,13 @@ const HELP = [
   "/help — this message",
   "",
   "When a transcript is ready I'll ask how to recap it, and tell you how much",
-  "Fireflies storage is left. Four buttons:",
-  "  Haiku  — a model recap, cheap. The default for /sweep and the weekly job.",
-  "  Sonnet — a model recap, better at long or messy meetings.",
-  "  Notes  — no model at all: Fireflies' own summary, in the meeting's own",
-  "           language. Free. If Fireflies hasn't finished summarising yet I",
-  "           claim the page and finish it the moment it does.",
+  "Fireflies storage is left. The buttons:",
+  "  Claude / ChatGPT — open the app with the recap prompt filled in. The",
+  "           recap runs on your subscription, not the API, and lands on the",
+  "           same Notion page. Copy prompt is there if the app opens empty.",
+  "  Haiku  — an API recap, cheap. The default for /sweep and the twice-weekly",
+  "           job, which recap anything still Pending — so finish a chat recap",
+  "           before then, or tap Skip.",
   "  Skip   — no recap; the page stays as a record that the meeting happened.",
   "",
   "Anything else you type, I answer from your meeting notes:",
@@ -157,7 +158,7 @@ async function handleCallback(callbackQuery) {
         `Fireflies hasn't finished its notes for "${meeting.name}" yet. ` +
           `I've claimed the page and I'll finish it the moment they land` +
           `${result.reason ? ` (${result.reason})` : ""}. ` +
-          `Tap Haiku or Sonnet on that meeting if you'd rather not wait.`
+          `Recap it in Claude or ChatGPT if you'd rather not wait.`
       );
     }
     return;
