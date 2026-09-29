@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import { config as app } from "../../lib/config.js";
 import { findMeetingByFirefliesId, createStubPage, findPendingNotes } from "../../lib/notion.js";
 import { sendMessage, sendTierPrompt } from "../../lib/telegram.js";
-import { usageLine } from "../../lib/usage.js";
+import { usageLine, PROMPT_PROBE_TIMEOUT_MS } from "../../lib/usage.js";
+import { getTitle } from "../../lib/fireflies.js";
 import { triggerPromotions } from "../../lib/promote.js";
 import { timestampLabel, epochToLocalIso } from "../../lib/dates.js";
 
@@ -93,13 +94,26 @@ async function handleTranscribed(meetingId, payload) {
   const page = await createStubPage({ meetingId, label, dateIso: epochToLocalIso(ts) });
 
   // The storage reading rides along on the prompt: this is the one moment per
-  // meeting when it is both fresh and actionable. usageLine() never throws and
-  // times out well inside Fireflies' 10-second acknowledgement budget — the
-  // prompt goes out without the line rather than the delivery failing. The page
-  // already exists by this point, so even a slow probe cannot cost you it.
-  await sendTierPrompt(meetingId, label, await usageLine());
+  // meeting when it is both fresh and actionable. The real title rides along
+  // too, for the chat hand-off prompt. Both probes never throw and run in
+  // PARALLEL, each timing out well inside Fireflies' 10-second acknowledgement
+  // budget — the prompt goes out without the line, or with the timestamp label,
+  // rather than the delivery failing. The page already exists by this point, so
+  // even a slow probe cannot cost you it.
+  const [extra, title] = await Promise.all([usageLine(), titleProbe(meetingId)]);
+  await sendTierPrompt(meetingId, { label, title, extra });
   console.log(`Created stub page ${page.page_id} for meeting ${meetingId}.`);
   return Response.json({ ok: true, page_id: page.page_id });
+}
+
+/** The meeting's real title, or null on any failure — same contract as usageLine(). */
+async function titleProbe(meetingId) {
+  try {
+    return await getTitle(meetingId, { timeoutMs: PROMPT_PROBE_TIMEOUT_MS });
+  } catch (err) {
+    console.warn(`Prompt goes out with the timestamp label instead of the title: ${err.message}`);
+    return null;
+  }
 }
 
 /**

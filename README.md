@@ -2,8 +2,8 @@
 
 Telegram → Fireflies → Claude → Notion. You ask the Fireflies bot to join a
 meeting; when the transcript is ready the bot asks how you want it recapped —
-two model tiers, Fireflies' own notes, or skip — and writes the result into
-Notion as a permanent record.
+in your Claude or ChatGPT app (on your subscription), with a cheap Haiku API
+call, or not at all — and the result lands in Notion as a permanent record.
 
 The point is **migration**, not task automation. Fireflies' free tier caps
 transcript storage at ~400 minutes and never purges on its own, so transcripts
@@ -25,12 +25,15 @@ Zero runtime dependencies — everything uses native `fetch`. Hosted on Netlify.
 Fireflies webhook (meeting.transcribed)
    └─ /fireflies ──▶ verify X-Hub-Signature
                  ──▶ stub page in Notion (Status: Pending)
-                 ──▶ Telegram prompt: [Haiku][Sonnet] / [Notes][Skip]
+                 ──▶ Telegram prompt: [Claude][ChatGPT] / [Haiku][Skip] / [Copy prompt]
                      + how many of your 400 Fireflies minutes are left
 
+Claude / ChatGPT ──▶ opens the app with the recap prompt prefilled (no bot call)
+                 ──▶ the chat's meeting-recap skill fills the SAME page, Status: Done
 Haiku  ──▶ /telegram ──▶ fetch transcript ──▶ extraction on claude-haiku-4-5
-Sonnet ──▶ /telegram ──▶ fetch transcript ──▶ extraction on claude-sonnet-5
                      ──▶ recap written to the page, Status: Done
+Sonnet, Notes — retired from the keyboard; still routed for old prompts:
+Sonnet ──▶ /telegram ──▶ fetch transcript ──▶ extraction on claude-sonnet-5
 Notes  ──▶ /telegram ──▶ fetch Fireflies' OWN summary, no model at all
                      ──▶ if it's ready: same page shape, Status: Done
                      ──▶ if not: Extraction State = Pending Notes, and:
@@ -53,14 +56,48 @@ trigger goes through `completeNotes()` in [lib/notes.js](lib/notes.js). Both
 ask the same `eligibility()` function whether the meeting has already been
 handled, so the tiers cannot drift apart on what "already done" means.
 
-### The four buttons
+### The buttons
 
 | Button | Model | Thinking | Cost | Writes `Extracted By` |
 |---|---|---|---|---|
+| **Claude** / **ChatGPT** | whatever the chat runs | — | your chat subscription, zero API tokens | the chat's model name (set by the skill) |
 | **Haiku** | `claude-haiku-4-5-20251001` | off — Haiku 4.5 rejects `adaptive` with a 400 | cheap tokens | the model id |
-| **Sonnet** | `claude-sonnet-5` | `adaptive` | tokens | the model id |
-| **Notes** | none | — | 1 Fireflies request, zero tokens | `fireflies-notes` |
 | **Skip** | none | — | nothing | — |
+| **Copy prompt** | — | — | — | — |
+
+Retired from new prompts but still routed, so a button in scrollback keeps
+working: **Sonnet** (`claude-sonnet-5`, `adaptive`) and **Notes** (Fireflies'
+own summary, no model). A tier's `offered` flag in
+[lib/config.js](lib/config.js) is what decides whether it gets a button.
+
+### The chat hand-off (Claude / ChatGPT)
+
+These are Telegram **URL buttons**, not callbacks: the bot never hears about
+the tap. Each opens `https://claude.ai/new?q=…` or `https://chatgpt.com/?q=…`
+with this prompt filled in:
+
+```
+Recap my Fireflies meeting "<title>" (Fireflies transcript ID: <id>) into my Notion Meetings database.
+```
+
+The chat's own meeting-recap skill (Fireflies + Notion connectors) does the
+rest. It looks the page up by `Source Meeting ID`, fills the existing stub, and
+sets `Status = Done`. That `Done` is the only signal the pipeline needs, and it
+keeps the sweep off the page.
+
+- **The title** comes from one extra Fireflies request at prompt time, run
+  alongside the storage probe with the same 4s timeout. If that request fails,
+  the prompt uses the timestamp label instead. The id is always there, so the
+  skill still finds the right meeting.
+- **App vs browser.** Telegram only allows `https://` and `tg://` on a URL
+  button, so there is no `claude://` deep link. Whether the link opens the app
+  or the website depends on the phone and on Telegram's in-app browser setting.
+  If the app opens without the prompt, tap **Copy prompt** and paste it.
+- **The sweep still applies.** A meeting that is still `Pending` at the next
+  Tue/Fri 22:00 sweep gets a Haiku recap. So finish the chat recap before then,
+  or tap Skip.
+- Override the wording with `CHAT_RECAP_PROMPT` (`{title}`, `{id}`) and the
+  links with `CLAUDE_CHAT_URL` / `CHATGPT_CHAT_URL` (`{prompt}`).
 
 **Haiku is the default.** It is what `/sweep`, the scheduled sweep, and a legacy
 `yes:` callback from a prompt still sitting in your scrollback all resolve to.
@@ -409,7 +446,7 @@ A recap costs a few cents of tokens. Everything else is inside the free tiers.
 | Extraction 400 on the tool schema | Set `LLM_STRICT_TOOLS=0` and redeploy |
 | 400 mentioning `thinking` after changing `LLM_MODEL` | That model predates adaptive thinking; set `LLM_THINKING=off` |
 | 400 mentioning `thinking` from a tier | A tier model that rejects `adaptive`; `npm run verify` prints each tier's mode |
-| A page stuck on `Pending Notes` | Fireflies never summarised it. Tap Haiku or Sonnet to take it over, or wait for the 24h backstop |
+| A page stuck on `Pending Notes` | Fireflies never summarised it. Recap it in Claude or ChatGPT, or tap Haiku, to take it over, or wait for the 24h backstop |
 | No storage line on the prompt | The usage probe failed or timed out; it is deliberately non-fatal. Netlify logs say why |
 | The sweep suddenly recaps nothing | The `Extraction State` exclusion; `npm run verify` checks it against the live database |
 | Notion 400 saying a property does not exist | `Extraction State` or `Extracted By` was never added. Both are now required on every write — add them (see Setup step 1) and re-run `npm run verify` |
