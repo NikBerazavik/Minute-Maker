@@ -1,7 +1,7 @@
 import { config as app, resolveTier, isTierKey } from "../../lib/config.js";
 import { sendMessage, answerCallbackQuery, editMessageText } from "../../lib/telegram.js";
 import { findMeetingByFirefliesId, findSweepablePages } from "../../lib/notion.js";
-import { promoteMeeting, skipMeeting, triggerPromotions } from "../../lib/promote.js";
+import { promoteMeeting, skipMeeting, formatUnsummarised } from "../../lib/promote.js";
 import { notesRecap } from "../../lib/notes.js";
 import { addToLiveMeeting, getUsage, FirefliesError } from "../../lib/fireflies.js";
 import { formatReport } from "../../lib/usage.js";
@@ -32,7 +32,7 @@ const HELP = [
   "  Quotes are the safe form: everything inside them is the title, the word",
   "  after them is the language (thai, english, or a code like th, ja, zh-CN).",
   "  Both are optional — without a language I let Fireflies auto-detect it.",
-  "/sweep — process any meeting still waiting on an answer",
+  "/sweep — list meetings that have no recap yet (nothing is recapped for you)",
   "/space — how much Fireflies transcription storage is left",
   "/help — this message",
   "",
@@ -41,9 +41,9 @@ const HELP = [
   "  Claude / ChatGPT — open the app with the recap prompt filled in. The",
   "           recap runs on your subscription, not the API, and lands on the",
   "           same Notion page. Copy prompt is there if the app opens empty.",
-  "  Haiku  — an API recap, cheap. The default for /sweep and the twice-weekly",
-  "           job, which recap anything still Pending — so finish a chat recap",
-  "           before then, or tap Skip.",
+  "  Haiku  — an API recap, cheap. Only runs when you tap it; nothing recaps",
+  "           automatically. /sweep and the Tue/Fri reminder just list what's",
+  "           still waiting.",
   "  Skip   — no recap; the page stays as a record that the meeting happened.",
   "",
   "Anything else you type, I answer from your meeting notes:",
@@ -108,17 +108,7 @@ async function handleSweep() {
     return sendMessage("Nothing is waiting — every meeting is recapped or skipped.");
   }
 
-  // Each promotion runs in its own background invocation rather than inline:
-  // 20 transcripts back to back would not fit in this function's 15 minutes.
-  // Every run reports its own result, so the reply here is just the receipt.
-  const { triggered, failed } = await triggerPromotions(pending, { allowFailed: true });
-  const lines = [`Recapping ${triggered.length} meeting(s). I'll message you as each one lands.`];
-  for (const m of triggered) lines.push(`- ${m.name}`);
-  if (failed.length) {
-    lines.push("", `${failed.length} could not be started — check the Netlify logs:`);
-    for (const m of failed) lines.push(`- ${m.name}`);
-  }
-  return sendMessage(lines.join("\n"));
+  return sendMessage(formatUnsummarised(pending));
 }
 
 async function handleCallback(callbackQuery) {

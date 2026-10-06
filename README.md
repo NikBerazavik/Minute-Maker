@@ -41,16 +41,15 @@ Fireflies webhook (meeting.summarized)
        └─ /fireflies ──▶ /promote (mode: notes) ──▶ finishes the page
 Skip   ──▶ page body becomes "Skipped", Status: Skipped, page KEPT
 
-Tue+Fri 22:00 ──▶ sweep ──▶ /promote (one background run per meeting)
-                        ──▶ 24h backstop for stranded Notes stubs
-/sweep        ──▶ same promotion logic, on demand, and retries failures
+Tue+Fri 22:00 ──▶ sweep ──▶ Telegram list of meetings with no recap (NO model call)
+                        ──▶ 24h backstop for stranded Notes stubs (no model)
+/sweep        ──▶ same list, on demand (Failed meetings included)
 /space        ──▶ Fireflies storage meter (one API call, no LLM, no Notion)
 
 Anything else you type ──▶ tool-use loop over your meeting notes
 ```
 
-Every model-tier trigger — a Haiku or Sonnet tap, the scheduled sweep,
-`/sweep`, and a redelivered webhook — goes through one function,
+Every model-tier trigger — a Haiku or Sonnet tap and a redelivered webhook — goes through one function,
 `promoteMeeting()` in [lib/promote.js](lib/promote.js). Every Notes-tier
 trigger goes through `completeNotes()` in [lib/notes.js](lib/notes.js). Both
 ask the same `eligibility()` function whether the meeting has already been
@@ -93,16 +92,16 @@ keeps the sweep off the page.
   button, so there is no `claude://` deep link. Whether the link opens the app
   or the website depends on the phone and on Telegram's in-app browser setting.
   If the app opens without the prompt, tap **Copy prompt** and paste it.
-- **The sweep still applies.** A meeting that is still `Pending` at the next
-  Tue/Fri 22:00 sweep gets a Haiku recap. So finish the chat recap before then,
-  or tap Skip.
+- **Nothing recaps automatically.** A meeting that is still `Pending` at the
+  Tue/Fri 22:00 sweep is only *listed* in Telegram, so you can recap it in
+  Claude or ChatGPT on your subscription, or tap Skip. `/sweep` shows the same
+  list on demand.
 - Override the wording with `CHAT_RECAP_PROMPT` (`{title}`, `{id}`) and the
   links with `CLAUDE_CHAT_URL` / `CHATGPT_CHAT_URL` (`{prompt}`).
 
-**Haiku is the default.** It is what `/sweep`, the scheduled sweep, and a legacy
-`yes:` callback from a prompt still sitting in your scrollback all resolve to.
-Unattended runs are exactly the case where nobody chose, so they get the cheap
-model — a change from the pre-tier behaviour, which used Sonnet for everything.
+**Haiku is the default tier**, but only for a tap: it is what a legacy `yes:`
+callback from a prompt still sitting in your scrollback resolves to. No
+scheduled or unattended job calls a model any more.
 
 The tier table in [lib/config.js](lib/config.js) is the only place a tier is
 defined; the keyboard, the callback router and `promoteMeeting` all read it.
@@ -127,8 +126,7 @@ Pending Notes` — and finished by whichever of these arrives first:
 3. you, tapping `Haiku` or `Sonnet` on that meeting instead — an explicit tap
    takes the page over and clears the claim, so you are never stuck waiting.
 
-A claimed page is invisible to both sweeps. Without that, a meeting waiting on
-a *free* recap would be handed a *paid* one behind your back.
+A claimed page is left out of the sweep's list, since it is already being handled.
 
 ### Files
 
@@ -448,7 +446,7 @@ A recap costs a few cents of tokens. Everything else is inside the free tiers.
 | 400 mentioning `thinking` from a tier | A tier model that rejects `adaptive`; `npm run verify` prints each tier's mode |
 | A page stuck on `Pending Notes` | Fireflies never summarised it. Recap it in Claude or ChatGPT, or tap Haiku, to take it over, or wait for the 24h backstop |
 | No storage line on the prompt | The usage probe failed or timed out; it is deliberately non-fatal. Netlify logs say why |
-| The sweep suddenly recaps nothing | The `Extraction State` exclusion; `npm run verify` checks it against the live database |
+| The sweep suddenly lists nothing | The `Extraction State` exclusion; `npm run verify` checks it against the live database |
 | Notion 400 saying a property does not exist | `Extraction State` or `Extracted By` was never added. Both are now required on every write — add them (see Setup step 1) and re-run `npm run verify` |
-| A page stuck in Processing | It clears itself after 30 minutes and the next sweep retries it |
-| A page in Failed | `/sweep` retries it; the scheduled sweep deliberately does not |
+| A page stuck in Processing | It clears itself after 30 minutes and the next sweep lists it |
+| A page in Failed | `/sweep` and the scheduled sweep list it; tap a button on its prompt (or recap in chat) to retry |

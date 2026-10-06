@@ -89,6 +89,7 @@ const SCHEMA = {
 };
 
 const readStatus = (page) => page.properties.Status?.select?.name ?? page.properties.Status?.status?.name ?? null;
+const readName = (page) => page.properties.Name?.title?.[0]?.plain_text ?? "";
 const readState = (page) => page.properties["Extraction State"]?.select?.name || null;
 const readExtractedBy = (page) =>
   (page.properties["Extracted By"]?.rich_text || []).map((r) => r.plain_text ?? r.text?.content).join("") || null;
@@ -606,7 +607,7 @@ await test("No marks the page Skipped and keeps it as a record", async () => {
   assert(store.pages.has(page.id), "the page must be kept, not deleted");
 });
 
-await test("the sweep promotes only the meetings still pending, on the default tier", async () => {
+await test("the sweep lists meetings still pending and calls no model", async () => {
   const third = { ...transcribedPayload, meeting_id: "THIRDMEETING", timestamp: Date.parse("2026-09-03T03:00:00Z") };
   await firefliesFn(firefliesRequest(third));
   const target = [...store.pages.values()].find((p) => readSourceId(p) === "THIRDMEETING");
@@ -614,20 +615,23 @@ await test("the sweep promotes only the meetings still pending, on the default t
   process.env.URL = "https://site.test";
   store.promoteCalls = [];
   const llmBefore = store.llmCalls;
+  const before = store.telegram.length;
   await sweepFn();
 
-  equal(store.promoteCalls.length, 1, "only the one Pending meeting should be triggered");
-  equal(store.promoteCalls[0].page_id, target.id, "wrong page triggered");
-  // The trigger reaches the real background function, which does the work.
-  equal(store.llmCalls, llmBefore + 1, "the triggered run should have extracted");
-  equal(readStatus(store.pages.get(target.id)), "Done", "status after the sweep");
-
-  // Unattended runs are the case where nobody chose, so they get the cheap
-  // model — and Haiku 4.5 rejects "adaptive", so the body must carry no
-  // thinking key at all.
-  const req = store.extractRequests.at(-1);
-  equal(req.model, "claude-haiku-4-5-20251001", "the sweep must use the default tier");
-  equal(req.thinking, undefined, "Haiku must be sent with no thinking parameter");
+  equal(store.promoteCalls.length, 0, "the sweep must not trigger any recap");
+  equal(store.llmCalls, llmBefore, "the sweep must not spend any API tokens");
+  equal(readStatus(store.pages.get(target.id)), "Pending", "the page must be left alone");
+  const texts = store.telegram.slice(before).filter((t) => t.method === "sendMessage").map((t) => t.body.text || "");
+  assert(
+    texts.some((t) => /not summarised/.test(t) && t.includes(readName(target))),
+    `expected a list naming the pending meeting, got: ${texts.join(" | ")}`
+  );
+  // Leave the page terminal so later tests start clean.
+  await telegramFn(
+    telegramRequest({
+      callback_query: { id: "cb3b", from: { id: 12345 }, data: "no:THIRDMEETING", message: { message_id: 1002, chat: { id: 12345 } } },
+    })
+  );
 });
 
 await test("/promote refuses a call with the wrong internal secret", async () => {
@@ -667,22 +671,33 @@ await test("a transcript deleted from Fireflies marks the page Failed and says s
   );
 });
 
-await test("the scheduled sweep does not retry a Failed page", async () => {
+await test("the scheduled sweep reports a Failed page but does not retry it", async () => {
   store.promoteCalls = [];
+  const before = store.telegram.length;
   await sweepFn();
   equal(store.promoteCalls.length, 0, "a Failed page must not be retried by the schedule");
+  const texts = store.telegram.slice(before).filter((t) => t.method === "sendMessage").map((t) => t.body.text || "");
+  assert(texts.some((t) => /failed earlier/.test(t)), `expected the failed page to be listed, got: ${texts.join(" | ")}`);
 });
 
-await test("/sweep does retry a Failed page, and recaps it", async () => {
+await test("/sweep lists unsummarised meetings, Failed included, and recaps nothing", async () => {
   const before = store.llmCalls;
+  const msgs = store.telegram.length;
   store.promoteCalls = [];
   await telegramFn(telegramRequest({ message: { chat: { id: 12345 }, text: "/sweep" } }));
 
-  equal(store.promoteCalls.length, 1, "expected one promotion to be triggered");
-  equal(store.promoteCalls[0].allow_failed, true, "/sweep must ask for failed pages to be retried");
-  equal(store.llmCalls, before + 1, "expected one extraction");
+  equal(store.promoteCalls.length, 0, "/sweep must not trigger a recap");
+  equal(store.llmCalls, before, "/sweep must not spend any API tokens");
+  const texts = store.telegram.slice(msgs).filter((t) => t.method === "sendMessage").map((t) => t.body.text || "");
+  assert(texts.some((t) => /FOURTH|failed earlier/.test(t)), `expected the Failed meeting listed, got: ${texts.join(" | ")}`);
   const page = [...store.pages.values()].find((p) => readSourceId(p) === "FOURTHMEETING");
-  equal(readStatus(page), "Done", "status");
+  equal(readStatus(page), "Failed", "status must be untouched");
+  // Skip it so later sections do not keep seeing a Failed page.
+  await telegramFn(
+    telegramRequest({
+      callback_query: { id: "cb4b", from: { id: 12345 }, data: "no:FOURTHMEETING", message: { message_id: 1003, chat: { id: 12345 } } },
+    })
+  );
 });
 
 console.log("\n/join");
@@ -1319,18 +1334,16 @@ await test("findSweepablePages excludes a claimed page but still returns normal 
   assert(ids.includes(normal.page.id), "the sweep must still find ordinary pending pages");
 });
 
-await test("the scheduled sweep leaves a claimed page alone and recaps the rest", async () => {
+await test("the scheduled sweep never recaps, claimed page or not", async () => {
   process.env.URL = "https://site.test";
   store.promoteCalls = [];
   store.summary = SUMMARY;
+  const llmBefore = store.llmCalls;
 
   await sweepFn();
 
-  const claimed = [...store.pages.values()].filter((p) => readState(p) === "Pending Notes");
-  for (const p of claimed) {
-    assert(!store.promoteCalls.some((c) => c.page_id === p.id && c.mode !== "notes"), "a claimed page was sent for a model recap");
-  }
-  assert(store.promoteCalls.length > 0, "the sweep should still have promoted the ordinary pending page");
+  assert(!store.promoteCalls.some((c) => c.mode !== "notes"), "the sweep triggered a model recap");
+  equal(store.llmCalls, llmBefore, "the sweep must not spend any API tokens");
 });
 
 await test("the backstop fails a stub whose summary never arrived and releases the claim", async () => {
