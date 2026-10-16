@@ -23,7 +23,7 @@ import {
 import { normalizeExtraction, formatTranscript } from "../lib/extract.js";
 import { toApiMessages } from "../lib/llm/openrouter.js";
 import { verifySignature } from "../netlify/functions/fireflies.js";
-import { parseJoinCommand, resolveLanguage } from "../lib/join.js";
+import { parseJoinCommand, resolveLanguage, buildJoinLink, formatJoinCard, parseJoinCard } from "../lib/join.js";
 
 let failures = 0;
 function test(name, fn) {
@@ -551,6 +551,50 @@ test("blocksToText indents resolved child blocks", () => {
   const text = blocksToText([withKids]);
   assert(/- parent/.test(text), "parent line");
   assert(/ {2}- child/.test(text), `child should be indented: ${JSON.stringify(text)}`);
+});
+
+console.log("\nJoin links and cards");
+
+test("a Teams meeting ID and passcode become a meet link", () => {
+  const r = buildJoinLink({ platform: "teams", meeting_id: "123 456 789 012 3", passcode: "aB3x9Q" });
+  assert(r.link === "https://teams.microsoft.com/meet/1234567890123?p=aB3x9Q", r.link);
+  assert(r.password === "aB3x9Q", "password");
+});
+
+test("a visible link is used as-is, never rebuilt from an ID", () => {
+  const link = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc%40thread.v2/0?context=x";
+  const r = buildJoinLink({ platform: "teams", meeting_link: link, meeting_id: "999999999" });
+  assert(r.link === link, r.link);
+});
+
+test("Zoom and Google Meet IDs are normalised", () => {
+  assert(buildJoinLink({ platform: "zoom", meeting_id: "812 3456 7890" }).link === "https://zoom.us/j/81234567890", "zoom");
+  assert(buildJoinLink({ platform: "google_meet", meeting_id: "ABC DEFG HIJ" }).link === "https://meet.google.com/abc-defg-hij", "meet");
+});
+
+test("bad IDs, platforms and passcodes are errors, not guesses", () => {
+  assert(buildJoinLink({ platform: "teams", meeting_id: "12ab" }).error, "non-digit Teams id");
+  assert(buildJoinLink({ platform: "webex", meeting_id: "123456789" }).error, "no ID-only Webex link");
+  assert(buildJoinLink({ platform: "teams" }).error, "nothing to go on");
+  assert(buildJoinLink({ platform: "teams", meeting_id: "123456789", passcode: "x".repeat(33) }).error, "over-long passcode");
+  assert(buildJoinLink({ meeting_link: "javascript:alert(1)" }).error, "non-web link");
+});
+
+test("a join card reads back exactly what it was written with", () => {
+  const details = {
+    link: "https://teams.microsoft.com/meet/1234567890123?p=aB:3x",
+    title: "Weekly: sync — Q4",
+    password: "aB:3x",
+    language: "th",
+    starts: "2026-10-16 14:00",
+  };
+  const back = parseJoinCard(formatJoinCard(details, { note: "Link: https://evil.example" }));
+  for (const key of Object.keys(details)) assert(back[key] === details[key], `${key}: ${back[key]}`);
+});
+
+test("a card without a link or heading does not parse", () => {
+  assert(parseJoinCard("Title: x") === null, "no heading");
+  assert(parseJoinCard(formatJoinCard({ title: "x" })) === null, "no link");
 });
 
 console.log(failures === 0 ? "\nAll offline tests passed.\n" : `\n${failures} test(s) failed.\n`);

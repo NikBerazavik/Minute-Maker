@@ -69,6 +69,10 @@ const store = {
   titleFetches: 0, // title-only queries for the chat hand-off prompt
   titleFails: null, // set to an Error to make the title query fail
   meetingTitle: "UAT for CC AI", // what the title query returns
+  anthropicFailures: [], // queued error responses ({ status, body }) served before the next model call
+  rejectForcedToolChoice: false, // answer a forced tool_choice with a 400, like an unknown newer model
+  joinRateLimited: false, // addToLiveMeeting answers with Fireflies' rate-limit error
+  joinCount: 0, // addToLiveMeeting calls
 };
 
 // "Status" is legitimately either a Select or Notion's dedicated Status type
@@ -278,7 +282,11 @@ globalThis.fetch = async (url, options = {}) => {
   // ----- Fireflies ---------------------------------------------------------
   if (u === "https://api.fireflies.ai/graphql") {
     if (body.query.includes("addToLiveMeeting")) {
+      store.joinCount++;
       store.lastJoin = body.variables;
+      if (store.joinRateLimited) {
+        return json({ errors: [{ message: "Too many requests", code: "too_many_requests" }], data: null });
+      }
       return json({ data: { addToLiveMeeting: { success: true, message: "joining" } } });
     }
     if (body.query.includes("minutes_consumed")) {
@@ -351,15 +359,35 @@ globalThis.fetch = async (url, options = {}) => {
   }
 
   // ----- Telegram ----------------------------------------------------------
+  if (u.startsWith("https://api.telegram.org/file/")) {
+    store.telegram.push({ method: "downloadFile", body: { url: u } });
+    return new Response(Buffer.from("fake-png-bytes"), { status: 200 });
+  }
   if (u.startsWith("https://api.telegram.org")) {
     const method_ = u.split("/").pop();
+    if (method_ === "getFile") {
+      store.telegram.push({ method: method_, body });
+      return json({ ok: true, result: { file_id: body.file_id, file_path: `photos/${body.file_id}.jpg` } });
+    }
     store.telegram.push({ method: method_, body });
     return json({ ok: true, result: { message_id: 999, chat: { id: 12345 } } });
   }
 
   // ----- Model API ---------------------------------------------------------
   if (u === "https://api.anthropic.com/v1/messages") {
-    // The chat loop sends the three conversational tools; extraction sends one.
+    const failure = store.anthropicFailures.shift();
+    if (failure) {
+      store.llmFailuresServed = (store.llmFailuresServed || 0) + 1;
+      return new Response(failure.body ?? JSON.stringify({ error: { message: "Overloaded" } }), {
+        status: failure.status,
+        headers: { "retry-after": "0" },
+      });
+    }
+    if (store.rejectForcedToolChoice && body.tool_choice?.type === "tool") {
+      store.forcedRejections = (store.forcedRejections || 0) + 1;
+      return json({ type: "error", error: { type: "invalid_request_error", message: "tool_choice: type \"tool\" is not supported for this model." } }, 400);
+    }
+    // The chat loop sends the conversational tools; extraction sends one.
     if (body.tools?.[0]?.name !== "extract_meeting") {
       store.chatRequests.push(body);
       const scripted = store.chatScript.shift();
@@ -369,7 +397,10 @@ globalThis.fetch = async (url, options = {}) => {
 
     store.llmCalls++;
     store.extractRequests.push(body);
-    equal(body.tool_choice?.type, "tool", "mock: extraction must force the tool call");
+    // Forced tool choice 400s on Opus 5.5 / Sonnet 5.5 / Fable / Mythos, so the
+    // adapter must send auto to exactly those and force it everywhere else.
+    const forcedRejected = /^claude-(fable|mythos|opus-5-5|sonnet-5-5)/.test(body.model) || store.rejectForcedToolChoice;
+    equal(body.tool_choice?.type, forcedRejected ? "auto" : "tool", "mock: extraction tool_choice");
     return json({
       id: "msg_1",
       model: body.model,
@@ -551,8 +582,8 @@ await test("the legacy yes: callback still works and runs the default tier", asy
   // A prompt still in Telegram scrollback from before the tiers shipped sends
   // "yes:". It must resolve to the default tier, not "Unrecognised action".
   const req = store.extractRequests.at(-1);
-  equal(req.model, "claude-haiku-4-5-20251001", "legacy yes: must run the default tier");
-  equal(readExtractedBy(page), "claude-haiku-4-5-20251001", "Extracted By");
+  equal(req.model, "claude-haiku-5-5", "legacy yes: must run the default tier");
+  equal(readExtractedBy(page), "claude-haiku-5-5", "Extracted By");
 
   const blocks = store.children.get(page.id);
   const texts = blocks.map((b) => (b[b.type].rich_text || []).map((r) => r.text.content).join(""));
@@ -718,6 +749,24 @@ await test("/join defaults to auto language detection", async () => {
   );
   equal(store.lastJoin.language, "auto", "default language");
   equal(store.lastJoin.title, "Thai standup", "title unaffected");
+});
+
+await test("/join always sends a duration, so Fireflies' 60-minute default cannot cut a meeting short", async () => {
+  await telegramFn(
+    telegramRequest({ message: { chat: { id: 12345 }, text: "/join https://teams.microsoft.com/meet/789 Long review" } })
+  );
+  equal(store.lastJoin.duration, 120, "duration");
+  equal(store.lastJoin.meeting_password, undefined, "no password unless one was given");
+});
+
+await test("an edited message is ignored rather than re-run", async () => {
+  const joinsBefore = store.joinCount;
+  const before = store.telegram.length;
+  await telegramFn(
+    telegramRequest({ edited_message: { chat: { id: 12345 }, text: "/join https://teams.microsoft.com/meet/999 Edited" } })
+  );
+  equal(store.joinCount, joinsBefore, "an edit must not spend another join");
+  equal(store.telegram.length, before, "and must not get a reply");
 });
 
 await test("/join --lang overrides the default and is stripped from the title", async () => {
@@ -959,6 +1008,170 @@ await test("/space warns once past the threshold and never shows negative minute
 
 
 // ---------------------------------------------------------------------------
+// Screenshot -> confirmation card -> Fireflies
+// ---------------------------------------------------------------------------
+
+console.log("\nScreenshot join");
+
+const { minutesUntil } = await import("../lib/dates.js");
+const { parseJoinCard } = await import("../lib/join.js");
+
+/** Local "YYYY-MM-DDTHH:MM" for a time `minutes` from now, in the configured +07:00. */
+function localIn(minutes) {
+  return new Date(Date.now() + minutes * 60000 + 7 * 3600000).toISOString().slice(0, 16);
+}
+const photoUpdate = (caption) => ({
+  message: {
+    chat: { id: 12345 },
+    photo: [
+      { file_id: "small", file_size: 1000, width: 90, height: 90 },
+      { file_id: "large", file_size: 90000, width: 1280, height: 960 },
+    ],
+    ...(caption ? { caption } : {}),
+  },
+});
+const cardCallback = (choice, text) =>
+  telegramRequest({
+    callback_query: { id: `cb-join-${choice}`, from: { id: 12345 }, data: `join:${choice}`, message: { message_id: 3000, chat: { id: 12345 }, text } },
+  });
+const lastCard = () => [...store.telegram].reverse().find((t) => t.method === "sendMessage" && /^Send Fireflies/.test(t.body.text || ""));
+
+await test("a screenshot reaches the model as an image and produces a join card", async () => {
+  store.chatRequests = [];
+  store.chatScript = [
+    {
+      stop_reason: "tool_use",
+      content: [
+        {
+          type: "tool_use",
+          id: "tu_join",
+          name: "join_meeting",
+          input: { platform: "teams", meeting_id: "123 456 789 012 3", passcode: "aB3x9Q", title: "Policy review", starts_at: localIn(5) },
+        },
+      ],
+    },
+    { stop_reason: "end_turn", content: [] },
+  ];
+  const before = store.telegram.length;
+  const joinsBefore = store.joinCount;
+  await telegramFn(telegramRequest(photoUpdate()));
+
+  const download = store.telegram.slice(before).find((t) => t.method === "getFile");
+  equal(download?.body.file_id, "large", "the largest photo size must be downloaded");
+  const first = store.chatRequests[0].messages[0].content;
+  equal(first[0].type, "image", "the image goes first");
+  equal(first[0].source.media_type, "image/jpeg", "media type");
+  equal(first[0].source.data, Buffer.from("fake-png-bytes").toString("base64"), "image data");
+  equal(first[1].type, "text", "then the caption text");
+
+  const card = lastCard();
+  assert(card, "no join card was sent");
+  assert(card.body.text.includes("Link: https://teams.microsoft.com/meet/1234567890123?p=aB3x9Q"), card.body.text);
+  assert(card.body.text.includes("Passcode: aB3x9Q"), "passcode line");
+  equal(card.body.reply_markup.inline_keyboard[0].map((b) => b.callback_data).join(","), "join:send,join:cancel", "buttons");
+  equal(store.joinCount, joinsBefore, "nothing may join before the tap");
+
+  const after = store.telegram.slice(before).filter((t) => t.method === "sendMessage");
+  equal(after.length, 1, "only the card — the model had nothing to add");
+});
+
+await test("tapping Send joins with the link, passcode and duration from the card", async () => {
+  const card = lastCard().body.text;
+  await telegramFn(cardCallback("send", card));
+  equal(store.lastJoin.meeting_link, "https://teams.microsoft.com/meet/1234567890123?p=aB3x9Q", "link");
+  equal(store.lastJoin.meeting_password, "aB3x9Q", "password");
+  equal(store.lastJoin.title, "Policy review", "title");
+  equal(store.lastJoin.duration, 120, "duration");
+  assert(/Fireflies is joining "Policy review"/.test(lastTelegram("editMessageText").body.text), "the card becomes the confirmation");
+  assert(!lastTelegram("editMessageText").body.reply_markup, "the buttons are gone after the join");
+});
+
+await test("a rate-limited Send puts the button back on the card", async () => {
+  const card = lastCard().body.text;
+  store.joinRateLimited = true;
+  try {
+    await telegramFn(cardCallback("send", card));
+  } finally {
+    store.joinRateLimited = false;
+  }
+  const edit = lastTelegram("editMessageText");
+  assert(edit.body.reply_markup, "the Send button must come back");
+  assert(/rate limited/.test(edit.body.text), edit.body.text);
+  equal(parseJoinCard(edit.body.text)?.link, "https://teams.microsoft.com/meet/1234567890123?p=aB3x9Q", "the restored card still parses");
+});
+
+await test("Cancel sends nothing", async () => {
+  const joinsBefore = store.joinCount;
+  await telegramFn(cardCallback("cancel", lastCard().body.text));
+  equal(store.joinCount, joinsBefore, "no join");
+  assert(/Cancelled/.test(lastTelegram("editMessageText").body.text), "card says cancelled");
+});
+
+await test("a card whose text cannot be read back joins nothing", async () => {
+  const joinsBefore = store.joinCount;
+  await telegramFn(cardCallback("send", "something else entirely"));
+  equal(store.joinCount, joinsBefore, "no join");
+  assert(/couldn't read/.test(lastTelegram("editMessageText").body.text), "explains the problem");
+});
+
+await test("a meeting hours away gets no card", async () => {
+  store.chatScript = [
+    {
+      stop_reason: "tool_use",
+      content: [
+        {
+          type: "tool_use",
+          id: "tu_join_later",
+          name: "join_meeting",
+          input: { platform: "teams", meeting_id: "1234567890123", passcode: "x", title: "Later", starts_at: localIn(180) },
+        },
+      ],
+    },
+    { stop_reason: "end_turn", content: [{ type: "text", text: "That meeting starts in about 3 hours — send it again closer to the time." }] },
+  ];
+  const before = store.telegram.length;
+  await telegramFn(telegramRequest(photoUpdate("join this")));
+  const sent = store.telegram.slice(before).filter((t) => t.method === "sendMessage");
+  assert(!sent.some((t) => /^Send Fireflies/.test(t.body.text)), "no card for a future meeting");
+  const toolResult = JSON.parse(store.chatRequests.at(-1).messages.at(-1).content[0].content);
+  equal(toolResult.not_sent, true, "the tool tells the model why");
+  assert(sent.some((t) => /3 hours/.test(t.body.text)), "the model's explanation is sent");
+});
+
+await test("an unsupported image file gets a plain answer and no model call", async () => {
+  store.chatRequests = [];
+  const before = store.telegram.length;
+  await telegramFn(
+    telegramRequest({
+      message: { chat: { id: 12345 }, document: { file_id: "heic1", file_name: "IMG_1.HEIC", mime_type: "image/heic", file_size: 2000 } },
+    })
+  );
+  equal(store.chatRequests.length, 0, "no model call");
+  const reply = store.telegram.slice(before).find((t) => t.method === "sendMessage");
+  assert(/JPEG, PNG, GIF or WebP/.test(reply.body.text), reply.body.text);
+});
+
+await test("an image file over the model's limit is refused before download", async () => {
+  const before = store.telegram.length;
+  await telegramFn(
+    telegramRequest({
+      message: { chat: { id: 12345 }, document: { file_id: "huge", file_name: "cal.png", mime_type: "image/png", file_size: 9 * 1024 * 1024 } },
+    })
+  );
+  const sent = store.telegram.slice(before);
+  assert(!sent.some((t) => t.method === "getFile"), "must not download");
+  assert(sent.some((t) => /over 5 MB/.test(t.body.text || "")), "explains the limit");
+});
+
+await test("minutesUntil reads a local time in the configured offset", async () => {
+  const now = Date.parse("2026-10-16T07:00:00Z"); // 14:00 in Bangkok
+  equal(minutesUntil("2026-10-16T14:30", now), 30, "local wall-clock time");
+  equal(minutesUntil("2026-10-16 13:45", now), -15, "a space separator and a past time");
+  equal(minutesUntil("2026-10-16T07:30:00Z", now), 30, "an explicit offset is honoured");
+  equal(minutesUntil("tomorrow at 3", now), null, "unreadable");
+});
+
+// ---------------------------------------------------------------------------
 // Extraction tiers
 // ---------------------------------------------------------------------------
 
@@ -991,29 +1204,92 @@ const blockTexts = (pageId) =>
 
 console.log("\nExtraction tiers");
 
-await test("Haiku runs the cheap model with no thinking parameter", async () => {
+await test("Haiku runs Haiku 5.5 with a forced tool call and an explicit effort", async () => {
   const { id, page } = await freshMeeting();
   store.extractRequests = [];
   await tap("haiku", id);
 
   const req = store.extractRequests.at(-1);
-  equal(req.model, "claude-haiku-4-5-20251001", "model");
-  // Haiku 4.5 rejects thinking:{type:"adaptive"} with a 400. The key must be
-  // absent entirely, not set to "off" — that would 400 just the same.
-  equal(req.thinking, undefined, "no thinking key may be sent to Haiku");
+  equal(req.model, "claude-haiku-5-5", "model");
+  equal(req.thinking?.type, "adaptive", "thinking");
+  equal(req.output_config?.effort, "medium", "effort");
+  equal(req.tool_choice?.type, "tool", "Haiku 5.5 accepts a forced tool call");
   equal(readStatus(store.pages.get(page.id)), "Done", "status");
-  equal(readExtractedBy(store.pages.get(page.id)), "claude-haiku-4-5-20251001", "Extracted By records the model");
+  equal(readExtractedBy(store.pages.get(page.id)), "claude-haiku-5-5", "Extracted By records the model");
 });
 
-await test("Sonnet runs the better model with adaptive thinking", async () => {
+await test("Sonnet runs Sonnet 5.5 with auto tool choice, which it requires", async () => {
   const { id, page } = await freshMeeting();
   store.extractRequests = [];
   await tap("sonnet", id);
 
   const req = store.extractRequests.at(-1);
-  equal(req.model, "claude-sonnet-5", "model");
+  equal(req.model, "claude-sonnet-5-5", "model");
   equal(req.thinking?.type, "adaptive", "Sonnet must keep adaptive thinking");
-  equal(readExtractedBy(store.pages.get(page.id)), "claude-sonnet-5", "Extracted By");
+  equal(req.output_config?.effort, "high", "effort");
+  equal(req.tool_choice?.type, "auto", "forced tool_choice 400s on Sonnet 5.5");
+  equal(readStatus(store.pages.get(page.id)), "Done", "status");
+  equal(readExtractedBy(store.pages.get(page.id)), "claude-sonnet-5-5", "Extracted By");
+});
+
+await test("a Claude 4.x tier model gets no effort parameter", async () => {
+  process.env.LLM_EXTRACT_MODEL = "claude-haiku-4-5";
+  try {
+    const { id } = await freshMeeting();
+    store.extractRequests = [];
+    await tap("haiku", id);
+    equal(store.extractRequests.at(-1).output_config, undefined, "effort errors on Haiku 4.5");
+  } finally {
+    delete process.env.LLM_EXTRACT_MODEL;
+  }
+});
+
+await test("an unknown model that rejects forced tool_choice is retried with auto", async () => {
+  process.env.LLM_EXTRACT_MODEL = "claude-future-6";
+  store.rejectForcedToolChoice = true;
+  store.forcedRejections = 0;
+  try {
+    const { id, page } = await freshMeeting();
+    await tap("haiku", id);
+    equal(store.forcedRejections, 1, "the forced request is rejected once");
+    equal(readStatus(store.pages.get(page.id)), "Done", "the auto retry recaps the meeting");
+  } finally {
+    store.rejectForcedToolChoice = false;
+    delete process.env.LLM_EXTRACT_MODEL;
+  }
+});
+
+await test("an overloaded model API is retried instead of failing the recap", async () => {
+  store.llmFailuresServed = 0;
+  // An overloaded gateway can answer in HTML, not JSON.
+  store.anthropicFailures = [{ status: 529 }, { status: 503, body: "<html>Service Unavailable</html>" }];
+  const { id, page } = await freshMeeting();
+  await tap("haiku", id);
+  equal(store.llmFailuresServed, 2, "both transient failures were served");
+  equal(readStatus(store.pages.get(page.id)), "Done", "the third attempt recaps the meeting");
+});
+
+await test("a model error that is not transient fails the page without retrying", async () => {
+  store.llmFailuresServed = 0;
+  store.anthropicFailures = [{ status: 400, body: JSON.stringify({ error: { message: "bad request" } }) }, { status: 529 }];
+  const { id, page } = await freshMeeting();
+  await tap("haiku", id);
+  equal(store.llmFailuresServed, 1, "a 400 is not retried");
+  equal(readStatus(store.pages.get(page.id)), "Failed", "status");
+  store.anthropicFailures = [];
+});
+
+await test("tapping Haiku on a Failed meeting retries it", async () => {
+  // Nothing retries a Failed page automatically any more, so the tap has to:
+  // refusing it would leave the meeting stuck with no way out.
+  const { id, page } = await freshMeeting();
+  store.transcriptExists = false;
+  await tap("haiku", id);
+  store.transcriptExists = true;
+  equal(readStatus(store.pages.get(page.id)), "Failed", "first attempt fails");
+
+  await tap("haiku", id);
+  equal(readStatus(store.pages.get(page.id)), "Done", "the retry recaps it");
 });
 
 await test("the two tiers reach the same page shape", async () => {
@@ -1047,7 +1323,7 @@ await test("LLM_MODEL must not leak into a tier", async () => {
     const { id } = await freshMeeting();
     store.extractRequests = [];
     await tap("haiku", id);
-    equal(store.extractRequests.at(-1).model, "claude-haiku-4-5-20251001", "the tier model must win");
+    equal(store.extractRequests.at(-1).model, "claude-haiku-5-5", "the tier model must win");
   } finally {
     delete process.env.LLM_MODEL;
   }
@@ -1185,7 +1461,7 @@ await test("a model tier takes over a claimed page and clears the claim", async 
   const p = store.pages.get(page.id);
   equal(readStatus(p), "Done", "status");
   equal(readState(p), null, "the claim must be released, or nothing can ever sweep this page");
-  equal(readExtractedBy(p), "claude-sonnet-5", "the model tier's record must win");
+  equal(readExtractedBy(p), "claude-sonnet-5-5", "the model tier's record must win");
 });
 
 await test("the Fireflies summary field set degrades instead of failing the tier", async () => {
@@ -1506,7 +1782,7 @@ await test("a retired Sonnet button in scrollback still runs Sonnet", async () =
   const { id, page } = await freshMeeting();
   store.extractRequests = [];
   await tap("sonnet", id);
-  equal(store.extractRequests.at(-1).model, "claude-sonnet-5", "model");
+  equal(store.extractRequests.at(-1).model, "claude-sonnet-5-5", "model");
   equal(readStatus(store.pages.get(page.id)), "Done", "status");
 });
 
