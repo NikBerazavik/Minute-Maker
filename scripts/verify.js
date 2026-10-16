@@ -5,7 +5,7 @@
 // property name, a database the integration was never connected to, a Status
 // option spelled differently in Notion than in config.
 //
-// Costs one Fireflies API request (the free plan allows 50 per day).
+// Costs one Fireflies API request against the daily quota.
 // ---------------------------------------------------------------------------
 
 import { config } from "../lib/config.js";
@@ -41,7 +41,7 @@ await check("Environment variables present", () => {
   config.internalSecret();
   if (config.llm.provider === "openrouter") config.llm.openrouter.apiKey();
   else config.llm.anthropic.apiKey();
-  return `provider ${config.llm.provider}, model ${config.llm.model}`;
+  return `provider ${config.llm.provider}, chat model ${config.llm.model} (effort ${config.llm.effort})`;
 });
 await check("Local time resolves", () => `${nowLocal()} (today = ${today()})`);
 
@@ -54,14 +54,16 @@ await check("Extraction tiers resolve", () => {
     if (!t.model) return `${t.label}: no model (writes "${t.extractedBy}")`;
     const model = override || t.model;
     const thinking = t.thinking && t.thinking !== "off" ? t.thinking : "off";
-    return `${t.label}: ${model} (thinking ${thinking})`;
+    return `${t.label}: ${model} (thinking ${thinking}, effort ${t.effort || "model default"})`;
   });
   if (override) rows.push(`LLM_EXTRACT_MODEL is overriding both model tiers with "${override}"`);
-  const haiku = config.extractTiers.find((t) => t.key === "haiku");
-  // The failure that shipped this whole per-tier design: Haiku 4.5 rejects
-  // "adaptive" with a 400 on the first call.
-  if (haiku && /haiku/i.test(haiku.model) && haiku.thinking !== "off") {
-    throw new Error(`the Haiku tier has thinking "${haiku.thinking}"; Haiku models reject anything but off`);
+  // The failure that shipped this whole per-tier design: Claude 4.x Haiku
+  // rejects "adaptive" with a 400 on the first call. The 5.x Haiku accepts it.
+  for (const t of config.extractTiers) {
+    const model = override || t.model;
+    if (model && /haiku-4/i.test(model) && t.thinking && t.thinking !== "off") {
+      throw new Error(`the ${t.label} tier runs ${model} with thinking "${t.thinking}"; Haiku 4.x rejects anything but off`);
+    }
   }
   return `default is ${config.extractTiers[0].label} — ${rows.join("; ")}`;
 });

@@ -4,10 +4,9 @@ import { promoteMeeting } from "../../lib/promote.js";
 import { completeNotes } from "../../lib/notes.js";
 
 // ---------------------------------------------------------------------------
-// Runs one meeting's promotion in its own invocation, so the scheduled sweep
-// (30-second ceiling) only has to TRIGGER work rather than perform it. A week
-// of ignored prompts therefore fans out into N independent 15-minute
-// background runs instead of one that blows the sweep's limit.
+// Runs one meeting's work in its own invocation, so callers with a short
+// ceiling — the meeting.summarized webhook (10 seconds) and the sweep's Notes
+// backstop (30 seconds) — only have to TRIGGER it rather than perform it.
 //
 // This URL is public, so it carries its own shared secret.
 // ---------------------------------------------------------------------------
@@ -32,7 +31,7 @@ export default async (req) => {
       return accepted;
     }
 
-    const { page_id, allow_failed, mode, tier, backstop } = await req.json();
+    const { page_id, mode, tier, backstop } = await req.json();
     if (!page_id) {
       console.warn("/promote called with no page_id.");
       return accepted;
@@ -41,13 +40,12 @@ export default async (req) => {
     // here: a thrown error would make Netlify retry the whole run twice more.
     //
     // mode "notes" is the zero-model path — meeting.summarized and the sweep's
-    // 24-hour backstop both arrive here. Anything else is an LLM tier; an
-    // absent tier resolves to the default (Haiku), which is what both sweeps
-    // send.
+    // 24-hour backstop both arrive here, and nothing else calls this today.
+    // Anything else is an LLM tier; an absent tier resolves to the default.
     if (mode === "notes") {
       await completeNotes(page_id, { backstop: Boolean(backstop) });
     } else {
-      await promoteMeeting(page_id, { allowFailed: Boolean(allow_failed), tier });
+      await promoteMeeting(page_id, { tier });
     }
   } catch (err) {
     console.error("/promote failed:", err);

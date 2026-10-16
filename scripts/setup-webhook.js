@@ -42,7 +42,7 @@ if (command === "set") {
     secret_token: secret,
     // callback_query is what carries the Yes/No taps. Without it here, the
     // buttons appear but nothing ever happens when they are pressed.
-    allowed_updates: ["message", "edited_message", "callback_query"],
+    allowed_updates: ["message", "callback_query"],
     drop_pending_updates: true,
   });
 

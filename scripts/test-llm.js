@@ -8,7 +8,7 @@
 // LLM_PROVIDER=openrouter and OPENROUTER_API_KEY, run this before trusting the
 // pipeline with a real meeting:
 //
-//   LLM_PROVIDER=openrouter LLM_MODEL=anthropic/claude-sonnet-5 npm run test:llm
+//   LLM_PROVIDER=openrouter LLM_MODEL=anthropic/claude-haiku-5-5 npm run test:llm
 //
 // It exercises the three things most likely to differ between providers:
 // a forced tool call, parsed tool arguments, and a second turn carrying the

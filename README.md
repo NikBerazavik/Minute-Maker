@@ -19,6 +19,10 @@ Zero runtime dependencies — everything uses native `fetch`. Hosted on Netlify.
 ```
 /join <link> <title>
    └─ Telegram ──▶ Fireflies addToLiveMeeting          (deterministic, no model)
+calendar screenshot (photo or image file)
+   └─ Telegram ──▶ Haiku 5.5 reads the link / Meeting ID + Passcode
+               ──▶ confirmation card [Send Fireflies][Cancel]
+               ──▶ Send ──▶ Fireflies addToLiveMeeting
 
 ... the meeting happens, Fireflies transcribes ...
 
@@ -30,10 +34,10 @@ Fireflies webhook (meeting.transcribed)
 
 Claude / ChatGPT ──▶ opens the app with the recap prompt prefilled (no bot call)
                  ──▶ the chat's meeting-recap skill fills the SAME page, Status: Done
-Haiku  ──▶ /telegram ──▶ fetch transcript ──▶ extraction on claude-haiku-4-5
+Haiku  ──▶ /telegram ──▶ fetch transcript ──▶ extraction on claude-haiku-5-5
                      ──▶ recap written to the page, Status: Done
 Sonnet, Notes — retired from the keyboard; still routed for old prompts:
-Sonnet ──▶ /telegram ──▶ fetch transcript ──▶ extraction on claude-sonnet-5
+Sonnet ──▶ /telegram ──▶ fetch transcript ──▶ extraction on claude-sonnet-5-5
 Notes  ──▶ /telegram ──▶ fetch Fireflies' OWN summary, no model at all
                      ──▶ if it's ready: same page shape, Status: Done
                      ──▶ if not: Extraction State = Pending Notes, and:
@@ -46,7 +50,7 @@ Tue+Fri 22:00 ──▶ sweep ──▶ Telegram list of meetings with no recap 
 /sweep        ──▶ same list, on demand (Failed meetings included)
 /space        ──▶ Fireflies storage meter (one API call, no LLM, no Notion)
 
-Anything else you type ──▶ tool-use loop over your meeting notes
+Anything else you type ──▶ tool-use loop over your meeting notes (claude-haiku-5-5)
 ```
 
 Every model-tier trigger — a Haiku or Sonnet tap and a redelivered webhook — goes through one function,
@@ -60,13 +64,13 @@ handled, so the tiers cannot drift apart on what "already done" means.
 | Button | Model | Thinking | Cost | Writes `Extracted By` |
 |---|---|---|---|---|
 | **Claude** / **ChatGPT** | whatever the chat runs | — | your chat subscription, zero API tokens | the chat's model name (set by the skill) |
-| **Haiku** | `claude-haiku-4-5-20251001` | off — Haiku 4.5 rejects `adaptive` with a 400 | cheap tokens | the model id |
+| **Haiku** | `claude-haiku-5-5` | `adaptive`, effort `medium` — the tool call is forced, so it writes the recap straight away | cheap tokens | the model id |
 | **Skip** | none | — | nothing | — |
 | **Copy prompt** | — | — | — | — |
 
 Retired from new prompts but still routed, so a button in scrollback keeps
-working: **Sonnet** (`claude-sonnet-5`, `adaptive`) and **Notes** (Fireflies'
-own summary, no model). A tier's `offered` flag in
+working: **Sonnet** (`claude-sonnet-5-5`, `adaptive`, effort `high`) and
+**Notes** (Fireflies' own summary, no model). A tier's `offered` flag in
 [lib/config.js](lib/config.js) is what decides whether it gets a button.
 
 ### The chat hand-off (Claude / ChatGPT)
@@ -101,7 +105,8 @@ keeps the sweep off the page.
 
 **Haiku is the default tier**, but only for a tap: it is what a legacy `yes:`
 callback from a prompt still sitting in your scrollback resolves to. No
-scheduled or unattended job calls a model any more.
+scheduled or unattended job calls a model any more. A tap also retries a
+meeting whose recap **Failed** — nothing else will.
 
 The tier table in [lib/config.js](lib/config.js) is the only place a tier is
 defined; the keyboard, the callback router and `promoteMeeting` all read it.
@@ -128,6 +133,36 @@ Pending Notes` — and finished by whichever of these arrives first:
 
 A claimed page is left out of the sweep's list, since it is already being handled.
 
+### Joining from a screenshot
+
+Send the bot a screenshot of the calendar event — a Teams or Outlook invite is
+the usual case — as a photo, or as a file to keep full resolution. A caption is
+optional ("thai" sets the language; "join now anyway" overrides the start-time
+check). The chat agent reads it and calls its `join_meeting` tool:
+
+- **A visible join link** is used exactly as shown.
+- **Meeting ID + Passcode** (what Outlook shows when the link is hidden behind
+  "Join the meeting now") becomes
+  `https://teams.microsoft.com/meet/<id>?p=<passcode>`, and the passcode is also
+  sent as Fireflies' `meeting_password`. Zoom IDs and Google Meet codes work
+  the same way; anything else needs the link.
+
+Nothing joins yet. The bot replies with a card showing what it read, with
+**Send Fireflies** and **Cancel**. One misread digit would otherwise spend one
+of your 3 joins per 20 minutes on the wrong meeting. The card is the state: the
+Send button reads the link back out of the card's own text, so the bot stores
+nothing. If Fireflies is rate limited, the button comes back.
+
+A meeting that starts more than `FIREFLIES_JOIN_LEAD_MINUTES` (15) from now gets
+no card, because `addToLiveMeeting` joins immediately.
+
+Every join, from `/join` or a card, sends `duration` (`FIREFLIES_JOIN_DURATION`,
+default 120 minutes). Without it, Fireflies uses 60 minutes, which would end
+the recording of a longer meeting early.
+
+> **The `teams.microsoft.com/meet/<id>?p=` form has not been tried with
+> Fireflies yet.** Before relying on it, test it on one throwaway meeting.
+
 ### Files
 
 | Path | Purpose |
@@ -142,7 +177,8 @@ A claimed page is left out of the sweep's list, since it is already being handle
 | `lib/extract.js` | Extraction schema, prompt, and result validation |
 | `lib/render.js` | Extraction JSON *and* Fireflies summaries → Notion blocks (no model) |
 | `lib/promote.js` | The shared "promote if still pending" function, and `eligibility()` |
-| `lib/agent.js`, `lib/tools.js` | The conversational loop and its three tools |
+| `lib/join.js` | `/join` parsing, join links from a meeting ID, the confirmation card's format |
+| `lib/agent.js`, `lib/tools.js` | The conversational loop and its four tools (search, read, add note, join) |
 | `netlify/functions/telegram.js` | Telegram webhook (background, 15 min) |
 | `netlify/functions/fireflies.js` | Fireflies webhook (synchronous, must be fast) |
 | `netlify/functions/promote-background.js` | One meeting's promotion, own invocation |
@@ -224,17 +260,23 @@ visible while the meeting is still running.
 
 Every model call goes through `lib/llm.js`, which exposes one neutral shape and
 picks an adapter from `LLM_PROVIDER`. `extract.js` and `agent.js` never see a
-vendor. To try a different Claude model:
+vendor. The chat agent runs on `claude-haiku-5-5` by default. To try a
+different Claude model:
 
 ```bash
-LLM_MODEL=claude-opus-5
+LLM_MODEL=claude-sonnet-5-5
+LLM_EFFORT=medium      # low | medium | high | xhigh | max
 ```
+
+**If `LLM_MODEL` is set in Netlify, it wins over the code default.** An old
+`LLM_MODEL=claude-sonnet-5` there keeps the chat on Sonnet 5 until you delete
+the variable.
 
 To trial other models through OpenRouter for cost or quality comparison:
 
 ```bash
 LLM_PROVIDER=openrouter
-LLM_MODEL=anthropic/claude-sonnet-5   # OpenRouter ids are vendor/model
+LLM_MODEL=anthropic/claude-haiku-5-5   # OpenRouter ids are vendor/model
 OPENROUTER_API_KEY=...
 ```
 
@@ -242,10 +284,25 @@ OPENROUTER_API_KEY=...
 the one-knob escape hatch, kept because `npm run test:llm` depends on it. For
 per-tier control use `LLM_MODEL_HAIKU` and `LLM_MODEL_SONNET`.
 
-Thinking is **per tier**, not global. `thinking: {type: "adaptive"}` is a
-Claude-5-family parameter and Haiku 4.5 rejects it with a 400, so the Haiku tier
-sends no `thinking` key at all while the Sonnet tier sends `adaptive`.
-`LLM_THINKING` still sets the default for the chat loop and the Sonnet tier.
+Thinking and effort are **per tier**, not global. Both 5.5 tiers send
+`thinking: {type: "adaptive"}` plus an explicit `output_config.effort`. Haiku
+5.5 defaults to `medium`, so the code sends it explicitly instead of relying
+on that default. Two things to know if you point a tier at another model:
+
+- **"off" is not off on the 5.x models.** `LLM_THINKING=off` sends no `thinking`
+  key, which turns thinking off on Claude 4.x but leaves the 5.x models on
+  their default adaptive thinking. Lower `effort` instead.
+- **Forced tool use** — which extraction relies on — returns a 400 on Sonnet
+  5.5, Opus 5.5 and Fable/Mythos. The adapter sends `tool_choice: auto` to
+  those (the prompt still names the tool). If an unknown model rejects it,
+  the adapter retries once with auto.
+
+Effort is left off automatically for models that predate it (Haiku 4.5 and
+the like). `LLM_THINKING` still sets the default for the chat loop and the
+Sonnet tier.
+
+Model calls retry up to three times on 429 / 5xx / 529 (overloaded), honouring
+`Retry-After`, so a brief overload no longer fails a recap.
 
 A tier only ever resolves to a *model string*; `chat()` picks the adapter from
 `LLM_PROVIDER` exactly as before. So an OpenRouter trial is still an env change
@@ -394,7 +451,7 @@ you've already deleted from Fireflies, so treat the first few as test data.
 
 | Thing | Limit |
 |---|---|
-| Fireflies API, free plan | 50 requests/day total |
+| Fireflies API, free plan | a small daily request quota (50/day originally; Fireflies' docs now say 500) |
 | Fireflies storage, free plan | 400 stored minutes — reported on every prompt, and by `/space` |
 | `addToLiveMeeting` | 3 requests / 20 minutes |
 | Fireflies webhook response | must be 2xx within 10 s |
@@ -413,6 +470,10 @@ A recap costs a few cents of tokens. Everything else is inside the free tiers.
 - **`/join` cannot be retried from a button.** Telegram caps `callback_data` at
   64 bytes and a Teams link is far longer, so there is nowhere to keep the
   link. On a rate-limit error the bot tells you to send the same `/join` again.
+  A screenshot's card *can* be retried, because the link is in the card text.
+- **Edited messages are ignored.** Editing an old `/join` used to send Fireflies
+  again; now send a new message instead. Run `npm run webhook:set` once so
+  Telegram stops delivering edits at all.
 - **A skipped meeting keeps its timestamp label** as its title, permanently —
   the real title only ever arrives with the transcript.
 - **No conversation memory.** Each Telegram message is independent, so "and
@@ -449,4 +510,6 @@ A recap costs a few cents of tokens. Everything else is inside the free tiers.
 | The sweep suddenly lists nothing | The `Extraction State` exclusion; `npm run verify` checks it against the live database |
 | Notion 400 saying a property does not exist | `Extraction State` or `Extracted By` was never added. Both are now required on every write — add them (see Setup step 1) and re-run `npm run verify` |
 | A page stuck in Processing | It clears itself after 30 minutes and the next sweep lists it |
-| A page in Failed | `/sweep` and the scheduled sweep list it; tap a button on its prompt (or recap in chat) to retry |
+| A page in Failed | `/sweep` and the scheduled sweep list it; tap Haiku on its prompt (or recap in chat) to retry |
+| A screenshot gets no card | The model could not read a link or ID (it says so), or the meeting starts more than 15 minutes from now |
+| Fireflies never arrives after Send | Try the same meeting's full join link with `/join`; if that works, the ID + passcode link form is the problem |
